@@ -85,6 +85,14 @@ jobs:
           go test ./internal/mirror ./cmd/...
           go test ./internal/airplay -v -run "FFmpeg|Resampler|PCM|AnnexB|ListedName|Loopback"
 
+      - name: Options of the hardware encoders in this FFmpeg build
+        continue-on-error: true
+        run: |
+          foreach ($e in "hevc_amf","hevc_nvenc","hevc_qsv","hevc_mf","h264_amf") {
+            Write-Host "== $e"
+            & dist\ffmpeg\ffmpeg.exe -hide_banner -h encoder=$e | Select-String -Pattern "^\s+-(aud|header_insertion_mode|usage|preset|tune|rc|rate_control|scenario|async_depth|zerolatency|forced-idr|forced_idr|latency|profile)\s" | ForEach-Object { $_.Line }
+          }
+
       - name: Icon resource
         continue-on-error: true
         run: |

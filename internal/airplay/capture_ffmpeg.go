@@ -378,9 +378,10 @@ func ffmpegEncoderArgs(encoder ffmpegEncoder, bitrate, fps int) []string {
 	case encoder.name == "libx264" || encoder.name == "libx265":
 		// These encoders repeat the parameter sets and write delimiters.
 	case encoder.codec == VideoCodecHEVC:
-		// The sender finds frame boundaries at access unit delimiters, and the
-		// receiver needs VPS, SPS and PPS before each IDR frame.
-		args = append(args, "-bsf:v", "hevc_metadata=aud=insert,dump_extra=freq=keyframe")
+		// No bitstream filter. The filters hevc_metadata and dump_extra read
+		// the encoder's separate header data, and FFmpeg stops if that data
+		// is not complete (hevc_amf gives no VPS there). The reader in this
+		// file finds the frame boundaries and repeats the parameter sets.
 	default:
 		args = append(args, "-bsf:v", "dump_extra=freq=keyframe")
 	}
@@ -545,6 +546,12 @@ func startFFmpegCaptureSource(startupCtx, lifetimeCtx context.Context, path stri
 // annexBAccessUnitReader splits an HEVC Annex B byte stream into access units
 // (one encoded frame each). The time stamp of a unit is the time at which its
 // first bytes came out of the encoder.
+//
+// Hardware encoders usually write the parameter sets (VPS, SPS, PPS) only
+// before the first key frame. A receiver that joins later, or a reader that
+// discards the first frames, needs them again. The reader therefore keeps
+// the newest parameter sets and puts them before each key frame that does
+// not have them.
 type annexBAccessUnitReader struct {
 	reader  io.Reader
 	parser  *h264Parser // splits at start codes; this part is the same for HEVC
@@ -553,6 +560,9 @@ type annexBAccessUnitReader struct {
 	current []byte
 	pts     time.Time
 	hasVCL  bool
+	hasIRAP bool
+	inUnit  [3]bool   // VPS, SPS, PPS are in the current unit
+	params  [3][]byte // newest VPS, SPS, PPS, without start code
 	now     func() time.Time
 }
 
@@ -574,14 +584,30 @@ func hevcStartsAccessUnit(raw []byte) bool {
 	return false
 }
 
+// finish moves the current access unit to the ready list.
+func (r *annexBAccessUnitReader) finish() {
+	unit := r.current
+	if r.hasIRAP && !(r.inUnit[0] && r.inUnit[1] && r.inUnit[2]) {
+		var withParams []byte
+		for index, param := range r.params {
+			if !r.inUnit[index] && len(param) > 0 {
+				withParams = append(withParams, annexBLongStartCode[:]...)
+				withParams = append(withParams, param...)
+			}
+		}
+		unit = append(withParams, unit...)
+	}
+	r.ready = append(r.ready, VideoAccessUnit{AnnexB: unit, PTS: r.pts})
+	r.current, r.hasVCL, r.hasIRAP, r.inUnit = nil, false, false, [3]bool{}
+}
+
 func (r *annexBAccessUnitReader) accept(nal []byte) error {
 	raw := stripStartCode(nal)
 	if len(raw) < 2 {
 		return nil
 	}
 	if r.hasVCL && hevcStartsAccessUnit(raw) {
-		r.ready = append(r.ready, VideoAccessUnit{AnnexB: r.current, PTS: r.pts})
-		r.current, r.hasVCL = nil, false
+		r.finish()
 	}
 	if len(r.current) == 0 {
 		r.pts = r.now()
@@ -591,8 +617,15 @@ func (r *annexBAccessUnitReader) accept(nal []byte) error {
 	}
 	r.current = append(r.current, annexBLongStartCode[:]...)
 	r.current = append(r.current, raw...)
-	if hevcNALType(raw) <= 31 {
+	switch typ := hevcNALType(raw); {
+	case typ >= 32 && typ <= 34:
+		r.params[typ-32] = append([]byte(nil), raw...)
+		r.inUnit[typ-32] = true
+	case typ <= 31:
 		r.hasVCL = true
+		if typ >= 16 && typ <= 23 {
+			r.hasIRAP = true
+		}
 	}
 	return nil
 }

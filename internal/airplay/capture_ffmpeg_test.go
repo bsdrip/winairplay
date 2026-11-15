@@ -151,9 +151,15 @@ func TestFFmpegBitrate(t *testing.T) {
 func TestFFmpegHEVCArgs(t *testing.T) {
 	cfg := CaptureConfig{FPS: 30, MaxWidth: 3840, MaxHeight: 2160}
 	args := strings.Join(ffmpegCaptureArgs(cfg, ffmpegHEVCEncoders["nvenc"], "ddagrab"), " ")
-	for _, want := range []string{"-c:v hevc_nvenc", "scale=3840:2160:", "-b:v 24883k", "hevc_metadata=aud=insert,dump_extra=freq=keyframe", "-f hevc pipe:1"} {
+	for _, want := range []string{"-c:v hevc_nvenc", "scale=3840:2160:", "-b:v 24883k", "-f hevc pipe:1"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("HEVC arguments do not contain %q:\n%s", want, args)
+		}
+	}
+	// A bitstream filter stops FFmpeg with hevc_amf (version 0.2.0 problem).
+	for _, method := range []string{"nvenc", "qsv", "amf", "mf"} {
+		if hw := strings.Join(ffmpegCaptureArgs(cfg, ffmpegHEVCEncoders[method], "ddagrab"), " "); strings.Contains(hw, "-bsf") {
+			t.Errorf("%s HEVC arguments must not have a bitstream filter:\n%s", method, hw)
 		}
 	}
 	args = strings.Join(ffmpegCaptureArgs(cfg, ffmpegHEVCEncoders["none"], "test"), " ")
@@ -216,4 +222,43 @@ func (o iotest1ByteReader) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	return o.r.Read(p[:1])
+}
+
+// A hardware encoder writes the parameter sets only before the first key
+// frame. The reader must put them before each later key frame.
+func TestAnnexBAccessUnitReaderRepeatsParameterSets(t *testing.T) {
+	const firstSlice = 0x80
+	var stream []byte
+	for _, nal := range [][]byte{
+		hevcNAL(32, 1), hevcNAL(33, 2), hevcNAL(34, 3), hevcNAL(19, firstSlice), // key frame with sets
+		hevcNAL(1, firstSlice),  // normal frame
+		hevcNAL(19, firstSlice), // key frame without sets
+		hevcNAL(34, 9), hevcNAL(20, firstSlice), // key frame with a new PPS only
+		hevcNAL(1, firstSlice), // closes the frame before
+	} {
+		stream = append(stream, nal...)
+	}
+	reader := newAnnexBAccessUnitReader(bytes.NewReader(stream))
+	types := func(unit VideoAccessUnit) (out []byte, payloads []byte) {
+		for _, nal := range splitAnnexBAccessUnit(unit.AnnexB) {
+			raw := stripStartCode(nal)
+			out = append(out, hevcNALType(raw))
+			payloads = append(payloads, raw[2])
+		}
+		return out, payloads
+	}
+	want := [][]byte{{32, 33, 34, 19}, {1}, {32, 33, 34, 19}, {32, 33, 34, 20}}
+	for i, wantTypes := range want {
+		unit, err := reader.ReadVideoAccessUnit()
+		if err != nil {
+			t.Fatalf("access unit %d: %v", i+1, err)
+		}
+		got, payloads := types(unit)
+		if !bytes.Equal(got, wantTypes) {
+			t.Errorf("access unit %d has NAL types %v, want %v", i+1, got, wantTypes)
+		}
+		if i == 3 && (len(payloads) < 3 || payloads[2] != 9) {
+			t.Errorf("access unit 4 must have the new PPS one time, got payloads %v", payloads)
+		}
+	}
 }
