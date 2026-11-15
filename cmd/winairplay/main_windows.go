@@ -84,8 +84,8 @@ type settings struct {
 	// SoundMode: 0 = TV and PC, 1 = TV only (mutes the PC), 2 = PC only.
 	SoundMode int `json:"soundMode"`
 	// NoSound is the setting of version 0.2. It is read as SoundMode 2.
-	NoSound bool `json:"noSound,omitempty"`
-	DebugLog     bool `json:"debugLog"`
+	NoSound  bool `json:"noSound,omitempty"`
+	DebugLog bool `json:"debugLog"`
 }
 
 func settingsPath() string {
@@ -512,7 +512,7 @@ func (a *app) onCommand(cmd int, devices []airplay.AirPlayDevice) {
 	case cmd == idDebugLog:
 		a.settings.DebugLog = !a.settings.DebugLog
 		airplay.SetDebugMode(a.settings.DebugLog)
-	airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
+		airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
 		a.settings.save()
 	case cmd >= idDevice && cmd < idDevice+len(devices):
 		a.startSession(devices[cmd-idDevice])
