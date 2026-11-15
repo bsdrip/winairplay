@@ -1,0 +1,49 @@
+winairplay
+==========
+
+winairplay is free software. You can redistribute it and modify it under the
+terms of the GNU Lesser General Public License, version 3 or (at your option)
+a later version. See LICENSE (LGPL-3.0) and COPYING.GPL (GPL-3.0, which the
+LGPL incorporates).
+
+Code from doubletake
+--------------------
+
+The AirPlay protocol implementation in internal/airplay and the test receiver
+in cmd/winairplay-test-receiver come from doubletake:
+
+    https://github.com/omarroth/doubletake
+    commit 5e2f1cbe3e1070bcefec8e549c7baf884727bc00 (2026-10-04)
+    License: LGPL-3.0-or-later
+
+This includes pairing (SRP-6a, pair-verify), the FairPlay SAP handshake, the
+RTSP session, the mirror stream, the event channel and the test receiver.
+
+Changes made for winairplay (2026-11-15):
+
+  - The Go import path changed to github.com/bsdrip/winairplay.
+  - internal/airplay/capture.go: the Linux process attribute moved to
+    childproc_linux.go; FFmpeg capture is selected on Windows; the encoder
+    names qsv, amf and mf are accepted; CaptureConfig has a Display field.
+  - internal/airplay/credentials.go: the default credential file is in the
+    winairplay directory of the user's configuration directory.
+  - internal/airplay/credentials_keyring.go: the keyring service name is
+    "winairplay".
+  - internal/airplay/pairing.go: the default client name is
+    "winairplay device".
+  - cmd/winairplay-test-receiver: program name and environment variable name.
+  - The doubletake daemon, the command line program, the KDE widget and the
+    manual pages are not included.
+
+New files in winairplay (not from doubletake):
+
+  - internal/airplay/capture_ffmpeg.go, capture_ffmpeg_test.go,
+    childproc_linux.go, childproc_windows.go, childproc_other.go
+  - internal/mirror (the session flow follows cmd/doubletake/main.go)
+  - cmd/winairplay, cmd/winairplay-cli
+
+Trademarks
+----------
+
+AirPlay, Apple TV and FairPlay are trademarks of Apple Inc. winairplay is not
+affiliated with Apple Inc. and Apple Inc. does not endorse it.
