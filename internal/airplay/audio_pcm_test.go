@@ -232,3 +232,38 @@ func TestSetAudioOutputMode(t *testing.T) {
 		t.Error("a mode that is not valid must select the default")
 	}
 }
+
+func TestPCMQueueReadFrameGivesPositionAndTime(t *testing.T) {
+	queue := newPCMQueue(4 * 100)
+	epoch := time.Unix(2000, 0)
+	queue.setEpoch(epoch)
+	reader := pcmQueueFrameReader{queue}
+
+	_, _ = queue.Write(make([]byte, 4*30))
+	frame := make([]byte, 4*10)
+	for want := int64(0); want < 30; want += 10 {
+		position, err := reader.ReadPCMFramePosition(frame)
+		if err != nil || !position.HasSourceRTP || int64(position.SourceRTP) != want {
+			t.Fatalf("position = %+v, %v; want sample %d", position, err, want)
+		}
+		if wantPTS := epoch.Add(time.Duration(want) * time.Second / audioSampleRate); !position.PTS.Equal(wantPTS) {
+			t.Errorf("sample %d has time %v, want %v", want, position.PTS, wantPTS)
+		}
+	}
+
+	// 150 frames into a queue for 100: the 50 oldest are discarded, and the
+	// position of the next frame shows the gap.
+	_, _ = queue.Write(make([]byte, 4*150))
+	position, err := reader.ReadPCMFramePosition(frame)
+	if err != nil || position.SourceRTP != 30+50 {
+		t.Fatalf("position after an overflow = %+v, %v; want sample 80", position, err)
+	}
+
+	// A frame that is not complete at the end of the stream is not returned.
+	queue = newPCMQueue(400)
+	_, _ = queue.Write(make([]byte, 4*5))
+	_ = queue.Close()
+	if _, err := (pcmQueueFrameReader{queue}).ReadPCMFrame(frame); err != io.EOF {
+		t.Errorf("read of a part frame after Close = %v, want io.EOF", err)
+	}
+}

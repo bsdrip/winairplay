@@ -57,10 +57,33 @@ func startPlatformAudioCapture(ctx context.Context, cancel context.CancelFunc, t
 			return fail(fmt.Errorf("start the audio test tone: %w", err))
 		}
 		go logStderr("AUDIO-FFMPEG", stderr)
+		// Send the tone through the same queue as real sound, so that the
+		// tests use the same time stamp path.
+		queue := newPCMQueue(audioQueueLimit)
+		go func() {
+			buf := make([]byte, 4096)
+			first := true
+			for {
+				n, err := stdout.Read(buf)
+				if n > 0 {
+					if first {
+						queue.setEpoch(time.Now())
+						first = false
+					}
+					_, _ = queue.Write(buf[:n])
+				}
+				if err != nil {
+					queue.closeWithError(nil)
+					return
+				}
+			}
+		}()
 		ac.gstCmd = cmd
-		ac.pcmPipe = stdout
+		ac.pcmPipe = queue
+		ac.pcmFrames = pcmQueueFrameReader{queue}
 		go func() {
 			ac.waitErr = <-waitResult
+			_ = stdout.Close()
 			close(ac.waitCh)
 		}()
 		return ac, nil
@@ -89,5 +112,6 @@ func startPlatformAudioCapture(ctx context.Context, cancel context.CancelFunc, t
 		return fail(fmt.Errorf("capture the sound of the PC: the audio device did not start"))
 	}
 	ac.pcmPipe = queue
+	ac.pcmFrames = pcmQueueFrameReader{queue}
 	return ac, nil
 }

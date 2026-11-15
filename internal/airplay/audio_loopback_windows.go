@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"runtime"
 	"syscall"
@@ -242,7 +241,7 @@ func (s *loopbackStream) readPackets(stereo []float32) ([]float32, int, error) {
 // to ready. Windows gives no data while no program plays sound, so this
 // function writes silence for those times: the receiver needs a continuous
 // stream. When the default device changes, it opens the new device.
-func runLoopbackCapture(ctx context.Context, out io.Writer, ready chan<- error) error {
+func runLoopbackCapture(ctx context.Context, out *pcmQueue, ready chan<- error) error {
 	// COM objects of this function stay on one thread.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -274,6 +273,8 @@ func runLoopbackCapture(ctx context.Context, out io.Writer, ready chan<- error) 
 	resampler := newStereoResampler(stream.format.sampleRate)
 	sourceRate := stream.format.sampleRate
 	clock := newRealtimeFrameClock(sourceRate, time.Now())
+	// Sample 0 of the output stream has the time at which the clock started.
+	out.setEpoch(clock.start)
 	var stereo []float32
 	var pcm []byte
 	lastOpenAttempt := time.Now()

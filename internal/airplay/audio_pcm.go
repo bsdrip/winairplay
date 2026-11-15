@@ -277,6 +277,59 @@ type pcmQueue struct {
 	limit  int
 	closed bool
 	err    error
+	// offset is the number of bytes that left the queue before data[0]:
+	// read or discarded. It gives each sample its position in the stream.
+	offset int64
+	// epoch is the capture time of the sample at position 0.
+	epoch time.Time
+}
+
+// setEpoch sets the capture time of the first sample. Call it before the
+// first Write.
+func (q *pcmQueue) setEpoch(t time.Time) {
+	q.mu.Lock()
+	q.epoch = t
+	q.mu.Unlock()
+}
+
+// readFrame fills dst completely. It returns the position (in sample
+// frames) and the capture time of the first sample in dst. The capture time
+// is exact arithmetic from the position, so it has no jitter: the receiver
+// gets a stable relation between time and sample position.
+func (q *pcmQueue) readFrame(dst []byte) (position int64, pts time.Time, err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.data) < len(dst) && !q.closed {
+		q.cond.Wait()
+	}
+	if len(q.data) < len(dst) {
+		if q.err != nil {
+			return 0, time.Time{}, q.err
+		}
+		return 0, time.Time{}, io.EOF
+	}
+	position = q.offset / audioBytesPerSampleFrame
+	pts = q.epoch.Add(time.Duration(position) * time.Second / audioSampleRate)
+	copy(dst, q.data)
+	q.data = append(q.data[:0], q.data[len(dst):]...)
+	q.offset += int64(len(dst))
+	return position, pts, nil
+}
+
+// pcmQueueFrameReader gives the encoder frames with their capture time.
+type pcmQueueFrameReader struct{ queue *pcmQueue }
+
+func (r pcmQueueFrameReader) ReadPCMFrame(dst []byte) (time.Time, error) {
+	_, pts, err := r.queue.readFrame(dst)
+	return pts, err
+}
+
+func (r pcmQueueFrameReader) ReadPCMFramePosition(dst []byte) (audioPCMFramePosition, error) {
+	position, pts, err := r.queue.readFrame(dst)
+	if err != nil {
+		return audioPCMFramePosition{}, err
+	}
+	return audioPCMFramePosition{PTS: pts, SourceRTP: uint32(position), HasSourceRTP: true}, nil
 }
 
 func newPCMQueue(limitBytes int) *pcmQueue {
@@ -295,6 +348,7 @@ func (q *pcmQueue) Write(p []byte) (int, error) {
 	if excess := len(q.data) - q.limit; excess > 0 {
 		excess = (excess + audioBytesPerSampleFrame - 1) &^ (audioBytesPerSampleFrame - 1)
 		q.data = append(q.data[:0], q.data[excess:]...)
+		q.offset += int64(excess)
 	}
 	q.cond.Broadcast()
 	return len(p), nil
@@ -314,6 +368,7 @@ func (q *pcmQueue) Read(p []byte) (int, error) {
 	}
 	n := copy(p, q.data)
 	q.data = append(q.data[:0], q.data[n:]...)
+	q.offset += int64(n)
 	return n, nil
 }
 

@@ -5,10 +5,9 @@ package airplay
 import (
 	"context"
 	"fmt"
-	"io"
 )
 
-func runLoopbackCapture(_ context.Context, _ io.Writer, ready chan<- error) error {
+func runLoopbackCapture(_ context.Context, _ *pcmQueue, ready chan<- error) error {
 	err := fmt.Errorf("sound capture is available only on 64-bit Windows")
 	ready <- err
 	return err
