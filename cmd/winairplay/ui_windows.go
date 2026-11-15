@@ -21,14 +21,34 @@ const (
 	idcSettings   = 2007
 
 	mainStyle   = wsCaption | wsSysMenu | wsMinimizeBox
-	mainClientW = 480
-	mainClientH = 410
+	mainClientW = 520
+	mainClientH = 486
+	listItemH   = 54
+
+	// Indexes of the state dot colors.
+	dotIdle   = 0 // saved, not found now
+	dotFound  = 1 // found, not connected
+	dotBusy   = 2 // connecting
+	dotActive = 3 // connected
+)
+
+// Colors of the window.
+var (
+	colorWhite     = rgb(255, 255, 255)
+	colorText      = rgb(27, 27, 27)
+	colorGray      = rgb(96, 96, 96)
+	colorSelected  = rgb(229, 241, 251)
+	colorAccent    = rgb(0, 103, 192)
+	colorDotIdle   = rgb(190, 190, 190)
+	colorDotFound  = rgb(0, 120, 212)
+	colorDotBusy   = rgb(240, 150, 0)
+	colorDotActive = rgb(16, 160, 80)
 )
 
 // mainWindow has the controls of the main window.
 type mainWindow struct {
-	status     uintptr
-	listLabel  uintptr
+	headline   uintptr
+	detail     uintptr
 	list       uintptr
 	connect    uintptr
 	disconnect uintptr
@@ -36,7 +56,8 @@ type mainWindow struct {
 	forget     uintptr
 	addIP      uintptr
 	settings   uintptr
-	rendered   string // the list contents that the list box shows now
+	gray       []uintptr // labels with gray text
+	rendered   string    // the list contents that the list box shows now
 }
 
 func (a *app) createMainWindow() error {
@@ -48,24 +69,28 @@ func (a *app) createMainWindow() error {
 		return fmt.Errorf("create the main window")
 	}
 	w := &a.window
-	child := func(class, text string, style uint32, x, y, width, height int32, id uintptr) uintptr {
+	child := func(class, text string, style uint32, font uintptr, x, y, width, height int32, id uintptr) uintptr {
 		hwnd := createWindow(0, class, text, wsChild|wsVisible|style, a.px(x), a.px(y), a.px(width), a.px(height), a.hwnd, id)
-		sendMessage(hwnd, wmSetFont, a.font, 1)
+		sendMessage(hwnd, wmSetFont, font, 1)
 		return hwnd
 	}
-	const margin, full = 14, mainClientW - 28
-	w.status = child("STATIC", a.status, ssLeft|ssNoPrefix, margin, 12, full, 36, 0)
-	w.listLabel = child("STATIC", "Devices", ssLeft, margin, 54, full, 18, 0)
-	w.list = child("LISTBOX", "", wsBorder|wsVScroll|wsTabStop|lbsNotify|lbsNoIntegralHeight, margin, 74, full, 216, idcList)
-	w.connect = child("BUTTON", "Connect", wsTabStop|bsDefPushButton, margin, 300, 108, 30, idcConnect)
-	w.disconnect = child("BUTTON", "Disconnect", wsTabStop, margin+114, 300, 108, 30, idcDisconnect)
-	w.search = child("BUTTON", "Search again", wsTabStop, margin+228, 300, 108, 30, idcSearch)
-	w.forget = child("BUTTON", "Forget", wsTabStop, margin+342, 300, 110, 30, idcForget)
-	w.addIP = child("BUTTON", "Add by IP address...", wsTabStop, margin, 338, 165, 30, idcAddIP)
-	w.settings = child("BUTTON", "Settings", wsTabStop, margin+171, 338, 108, 30, idcSettings)
-	child("STATIC", appName+" "+version, ssRight|ssNoPrefix, margin+285, 345, full-285, 18, 0)
-	child("STATIC", "If you close this window, winairplay continues in the notification area of the taskbar.",
-		ssLeft|ssNoPrefix, margin, 378, full, 28, 0)
+	const margin, full = 20, mainClientW - 40
+	w.headline = child("STATIC", a.status, ssLeft|ssNoPrefix, a.fontTitle, margin, 16, full, 32, 0)
+	w.detail = child("STATIC", "", ssLeft|ssNoPrefix, a.font, margin, 50, full, 36, 0)
+	w.list = child("LISTBOX", "", wsBorder|wsVScroll|wsTabStop|lbsNotify|lbsNoIntegralHeight|lbsOwnerDrawFixed|lbsHasStrings,
+		a.font, margin, 94, full, 4*listItemH+4, idcList)
+	sendMessage(w.list, lbSetItemHeight, 0, uintptr(a.px(listItemH)))
+	const buttonY, buttonH, gap = 326, 34, 8
+	w.connect = child("BUTTON", "Connect", wsTabStop|bsDefPushButton, a.font, margin, buttonY, 116, buttonH, idcConnect)
+	w.disconnect = child("BUTTON", "Disconnect", wsTabStop, a.font, margin+116+gap, buttonY, 116, buttonH, idcDisconnect)
+	w.search = child("BUTTON", "Search again", wsTabStop, a.font, margin+2*(116+gap), buttonY, 116, buttonH, idcSearch)
+	w.forget = child("BUTTON", "Forget", wsTabStop, a.font, margin+3*(116+gap), buttonY, full-3*(116+gap), buttonH, idcForget)
+	w.addIP = child("BUTTON", "Add by IP address...", wsTabStop, a.font, margin, buttonY+buttonH+gap, 180, buttonH, idcAddIP)
+	w.settings = child("BUTTON", "Settings", wsTabStop, a.font, margin+180+gap, buttonY+buttonH+gap, 116, buttonH, idcSettings)
+	versionLabel := child("STATIC", appName+" "+version, ssRight|ssNoPrefix, a.font, margin+312, buttonY+buttonH+gap+9, full-312, 18, 0)
+	hint := child("STATIC", "If you close this window, winairplay continues in the notification area of the taskbar. Click its icon to open the window again.",
+		ssLeft|ssNoPrefix, a.font, margin, 424, full, 40, 0)
+	w.gray = []uintptr{w.detail, versionLabel, hint}
 	return nil
 }
 
@@ -89,19 +114,55 @@ func (a *app) selectedRow() int {
 	return index
 }
 
-// refreshWindow shows the current status and device list in the window.
+// rowDetail is the second line of a device in the list.
+func rowDetail(row deviceRow, state string) (text string, dot int) {
+	d := row.device
+	parts := []string{}
+	if model := modelName(d.Model); model != "" {
+		parts = append(parts, model)
+	}
+	parts = append(parts, d.IP)
+	dot = dotFound
+	switch {
+	case row.active && state == "connected":
+		parts = append(parts, "Connected")
+		dot = dotActive
+	case row.active:
+		parts = append(parts, "Connecting...")
+		dot = dotBusy
+	case !row.found:
+		parts = append(parts, "Saved, not found now")
+		dot = dotIdle
+	case row.known:
+		parts = append(parts, "Saved")
+	}
+	return strings.Join(parts, "  ·  "), dot
+}
+
+// refreshWindow shows the current state and device list in the window.
 func (a *app) refreshWindow() {
 	w := &a.window
 	if w.list == 0 {
 		return
 	}
-	status := a.status
-	if a.searching && a.session == nil {
-		status += "\nSearching for AirPlay receivers..."
-	} else if len(a.rows) == 0 {
-		status += "\nNo AirPlay receiver found. Select \"Search again\" or \"Add by IP address...\"."
+	detail := a.detail
+	if detail == "" {
+		switch {
+		case a.session != nil:
+		case a.searching && len(a.rows) == 0:
+			detail = "Searching for AirPlay receivers..."
+		case len(a.rows) == 0:
+			detail = "No AirPlay receiver found. Select \"Search again\" or \"Add by IP address...\"."
+		default:
+			detail = "Select a device and click Connect."
+		}
 	}
-	setWindowText(w.status, status)
+	if windowText(w.headline) != a.status {
+		setWindowText(w.headline, a.status)
+	}
+	if windowText(w.detail) != detail {
+		setWindowText(w.detail, detail)
+	}
 
 	state := a.sessionState()
 	labels := make([]string, len(a.rows))
@@ -112,6 +173,8 @@ func (a *app) refreshWindow() {
 	// stable and the picture without flicker.
 	if rendered := strings.Join(labels, "\n"); rendered != w.rendered {
 		selected := a.shownSelectionKey()
+		a.shownRows = append(a.shownRows[:0], a.rows...)
+		a.shownState = state
 		sendMessage(w.list, lbResetContent, 0, 0)
 		selection := -1
 		for i, label := range labels {
@@ -130,10 +193,7 @@ func (a *app) refreshWindow() {
 			sendMessage(w.list, lbSetCurSel, uintptr(selection), 0)
 		}
 		w.rendered = rendered
-		a.renderedKeys = a.renderedKeys[:0]
-		for _, row := range a.rows {
-			a.renderedKeys = append(a.renderedKeys, deviceKey(row.device))
-		}
+		procInvalidateRect.Call(w.list, 0, 1)
 	}
 	a.updateButtons()
 }
@@ -142,10 +202,10 @@ func (a *app) refreshWindow() {
 // that the window shows now (before a refill).
 func (a *app) shownSelectionKey() string {
 	index := int(int32(sendMessage(a.window.list, lbGetCurSel, 0, 0)))
-	if index < 0 || index >= len(a.renderedKeys) {
+	if index < 0 || index >= len(a.shownRows) {
 		return ""
 	}
-	return a.renderedKeys[index]
+	return deviceKey(a.shownRows[index].device)
 }
 
 func (a *app) updateButtons() {
@@ -156,6 +216,60 @@ func (a *app) updateButtons() {
 	enableWindow(w.disconnect, a.session != nil)
 	enableWindow(w.forget, selected && a.rows[index].known && !a.rows[index].active)
 	enableWindow(w.search, !a.searching)
+}
+
+// drawDeviceItem draws one line of the device list: a state dot, the name
+// and a gray line with the model, the address and the state.
+func (a *app) drawDeviceItem(item *drawItem) {
+	r := item.rcItem
+	background := a.brushWhite
+	selected := item.itemState&odsSelected != 0
+	if selected {
+		background = a.brushSelected
+	}
+	procFillRect.Call(item.hdc, uintptr(unsafe.Pointer(&r)), background)
+	index := int(int32(item.itemID))
+	if index < 0 || index >= len(a.shownRows) {
+		return
+	}
+	row := a.shownRows[index]
+	if selected {
+		bar := rect{r.left, r.top + a.px(10), r.left + a.px(3), r.bottom - a.px(10)}
+		procFillRect.Call(item.hdc, uintptr(unsafe.Pointer(&bar)), a.brushAccent)
+	}
+	detail, dot := rowDetail(row, a.shownState)
+
+	pen, _, _ := procGetStockObject.Call(nullPen)
+	procSelectObject.Call(item.hdc, pen)
+	procSelectObject.Call(item.hdc, a.brushDots[dot])
+	size := a.px(12)
+	dotX := r.left + a.px(16)
+	dotY := r.top + (r.bottom-r.top-size)/2
+	procEllipse.Call(item.hdc, uintptr(dotX), uintptr(dotY), uintptr(dotX+size+1), uintptr(dotY+size+1))
+
+	name := row.device.Name
+	if name == "" {
+		name = row.device.IP
+	}
+	procSetBkMode.Call(item.hdc, transparent)
+	textLeft := r.left + a.px(42)
+	textRight := r.right - a.px(10)
+	drawText(item.hdc, name, rect{textLeft, r.top + a.px(8), textRight, r.top + a.px(29)}, a.fontBold, colorText)
+	drawText(item.hdc, detail, rect{textLeft, r.top + a.px(29), textRight, r.bottom - a.px(6)}, a.font, colorGray)
+}
+
+// staticColors sets the colors of a text label. It returns the brush for
+// the background of the label.
+func (a *app) staticColors(hdc, control uintptr) uintptr {
+	color := colorText
+	for _, gray := range a.window.gray {
+		if gray == control {
+			color = colorGray
+		}
+	}
+	procSetTextColor.Call(hdc, color)
+	procSetBkColor.Call(hdc, colorWhite)
+	return a.brushWhite
 }
 
 func (a *app) connectSelected() {
@@ -192,6 +306,12 @@ func mainWndProc(hwnd, rawMessage, wParam, lParam uintptr) uintptr {
 	case message == wmUICall:
 		a.runQueued()
 		return 0
+	case message == wmDrawItem && wParam == idcList:
+		// lParam is the address of a DRAWITEMSTRUCT that Windows owns.
+		a.drawDeviceItem((*drawItem)(unsafe.Add(unsafe.Pointer(nil), lParam)))
+		return 1
+	case message == wmCtlColorStatic:
+		return a.staticColors(wParam, lParam)
 	case message == wmCommand:
 		id, code := int(wParam&0xFFFF), int(wParam>>16&0xFFFF)
 		switch {
@@ -287,6 +407,8 @@ func promptWndProc(hwnd, rawMessage, wParam, lParam uintptr) uintptr {
 		case wmClose:
 			a.dialog.finish(false)
 			return 0
+		case wmCtlColorStatic:
+			return a.staticColors(wParam, lParam)
 		}
 	}
 	return defWindowProc(hwnd, message, wParam, lParam)

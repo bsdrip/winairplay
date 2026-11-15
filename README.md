@@ -136,8 +136,20 @@ doubletake and need Linux.
 ## Limits
 
 - One receiver at a time.
-- No HDR.
+- No HDR. winairplay sends standard dynamic range video (8-bit HEVC or
+  H.264). No public description and no open implementation exists of the
+  messages that put an AirPlay receiver into HDR mode for screen mirroring,
+  so this function cannot be added in a reliable way at this time.
 - The sound comes from the default output device only.
+
+## Other operating systems
+
+winairplay is a Windows program: its window, its screen capture and its
+sound capture use Windows functions. There is no Linux release.
+
+On Linux, use [doubletake](https://github.com/omarroth/doubletake). It is
+the program that the AirPlay code of winairplay comes from, and it has
+screen capture for Wayland and X11.
 
 ## Structure
 

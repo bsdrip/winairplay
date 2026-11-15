@@ -181,7 +181,13 @@ type app struct {
 	showUIMessage  uint32
 	logPath        string
 	dpi            int32
-	font           uintptr
+	font           uintptr // dialog font
+	fontBold       uintptr
+	fontTitle      uintptr
+	brushWhite     uintptr
+	brushSelected  uintptr
+	brushAccent    uintptr
+	brushDots      [4]uintptr // indexed by the dot* constants
 	window         mainWindow
 
 	// The fields below are used only on the UI thread.
@@ -189,13 +195,17 @@ type app struct {
 	devices  []airplay.AirPlayDevice // found by the search
 	missed   map[string]int          // searches in a row that did not find a device
 	rows     []deviceRow
-	// renderedKeys has the device key of each line that the list box shows.
-	renderedKeys []string
-	searching    bool
-	session      *activeSession
-	streaming    bool
-	status       string
-	dialog       *promptDialog
+	// shownRows has the device of each line that the list box shows now.
+	shownRows  []deviceRow
+	shownState string
+	// detail is the second line of the state: the stream format, the step
+	// of a connection, or the last problem.
+	detail    string
+	searching bool
+	session   *activeSession
+	streaming bool
+	status    string
+	dialog    *promptDialog
 
 	queueMu sync.Mutex
 	queue   []func()
@@ -237,7 +247,12 @@ func main() {
 	theApp = a
 	a.showUIMessage = showUIMessage
 	a.dpi = systemDPI()
-	a.font = messageFont()
+	initCommonControls()
+	a.font, a.fontBold, a.fontTitle = messageFonts()
+	a.brushWhite = solidBrush(colorWhite)
+	a.brushSelected = solidBrush(colorSelected)
+	a.brushAccent = solidBrush(colorAccent)
+	a.brushDots = [4]uintptr{solidBrush(colorDotIdle), solidBrush(colorDotFound), solidBrush(colorDotBusy), solidBrush(colorDotActive)}
 	a.logPath = setupLog()
 	airplay.SetDebugMode(a.settings.DebugLog)
 	airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
@@ -346,7 +361,11 @@ func (a *app) trayData(flags uint32) *notifyIconData {
 	if a.streaming {
 		data.icon = a.iconActive
 	}
-	copyU16(data.tip[:], appName+" - "+a.status)
+	tip := appName + " - " + a.status
+	if a.streaming && a.detail != "" {
+		tip += " (" + a.detail + ")"
+	}
+	copyU16(data.tip[:], tip)
 	return data
 }
 
@@ -867,6 +886,7 @@ func (a *app) stopSession() {
 	if a.dialog != nil {
 		a.dialog.cancel()
 	}
+	a.detail = ""
 	a.setStatus("Stopping")
 }
 
@@ -887,6 +907,7 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 		name = device.IP
 	}
 	a.status = "Connecting to " + name
+	a.detail = ""
 	a.updateTrayIcon()
 	a.rebuildRows()
 
@@ -918,8 +939,9 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 		},
 		Status: func(message string) {
 			a.call(func() {
-				if a.session == session {
-					a.setStatus(message)
+				if a.session == session && !a.streaming {
+					a.detail = message
+					a.refreshWindow()
 				}
 			})
 		},
@@ -935,7 +957,8 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 			a.call(func() {
 				if a.session == session {
 					a.streaming = true
-					a.status = "Mirroring to " + receiver + " (" + detail + ")"
+					a.status = "Mirroring to " + receiver
+					a.detail = detail
 					a.updateTrayIcon()
 					a.rememberDevice(session.device)
 					a.notify(appName, "Mirroring to "+receiver+" started: "+detail+".", false)
@@ -969,8 +992,9 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 			a.session = nil
 			a.streaming = false
 			a.status = "Not connected"
+			a.detail = ""
 			if err != nil && !errors.Is(err, mirror.ErrCancelled) {
-				a.status = "Not connected. Last problem: " + shortText(err.Error())
+				a.detail = "Last problem: " + shortText(err.Error())
 				a.notify("Mirroring stopped", shortText(err.Error()), true)
 			}
 			a.updateTrayIcon()

@@ -93,12 +93,6 @@ jobs:
             & dist\ffmpeg\ffmpeg.exe -hide_banner -h encoder=$e | Select-String -Pattern "^\s+-(aud|header_insertion_mode|usage|preset|tune|rc|rate_control|scenario|async_depth|zerolatency|forced-idr|forced_idr|latency|profile)\s" | ForEach-Object { $_.Line }
           }
 
-      - name: Icon resource
-        continue-on-error: true
-        run: |
-          go install github.com/akavel/rsrc@v0.10.2
-          & "$(go env GOPATH)\bin\rsrc.exe" -arch amd64 -ico installer\winairplay.ico -o cmd\winairplay\rsrc_windows_amd64.syso
-
       - name: Build
         run: |
           New-Item -ItemType Directory -Force dist\app | Out-Null

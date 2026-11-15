@@ -189,13 +189,14 @@ func moduleHandle() uintptr {
 
 func registerClass(name string, proc uintptr, icon uintptr) error {
 	cursor, _, _ := procLoadCursorW.Call(0, idcArrow)
+	white, _, _ := procGetStockObject.Call(whiteBrush)
 	wc := wndClassEx{
 		wndProc:    proc,
 		instance:   moduleHandle(),
 		icon:       icon,
 		iconSm:     icon,
 		cursor:     cursor,
-		background: colorBtnFace + 1,
+		background: white,
 		className:  u16(name),
 	}
 	wc.size = uint32(unsafe.Sizeof(wc))
@@ -377,4 +378,112 @@ func windowSizeForClient(width, height int32, style, exStyle uint32) (int32, int
 	r := rect{0, 0, width, height}
 	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&r)), uintptr(style), 0, uintptr(exStyle))
 	return r.right - r.left, r.bottom - r.top
+}
+
+// ---- additions for the drawn device list ----
+
+var (
+	comctl32                 = windows.NewLazySystemDLL("comctl32.dll")
+	procInitCommonControlsEx = comctl32.NewProc("InitCommonControlsEx")
+	procFillRect             = user32.NewProc("FillRect")
+	procDrawTextW            = user32.NewProc("DrawTextW")
+	procInvalidateRect       = user32.NewProc("InvalidateRect")
+	procCreateSolidBrush     = gdi32.NewProc("CreateSolidBrush")
+	procSetBkMode            = gdi32.NewProc("SetBkMode")
+	procSetBkColor           = gdi32.NewProc("SetBkColor")
+	procSetTextColor         = gdi32.NewProc("SetTextColor")
+	procSelectObject         = gdi32.NewProc("SelectObject")
+	procEllipse              = gdi32.NewProc("Ellipse")
+)
+
+const (
+	wmDrawItem       = 0x002B
+	wmCtlColorStatic = 0x0138
+
+	lbsOwnerDrawFixed = 0x0010
+	lbsHasStrings     = 0x0040
+	lbSetItemHeight   = 0x01A0
+	odsSelected       = 0x0001
+
+	whiteBrush  = 0
+	nullPen     = 8
+	transparent = 1
+
+	dtSingleLine  = 0x0020
+	dtNoPrefix    = 0x0800
+	dtEndEllipsis = 0x8000
+
+	iccStandardClasses = 0x4000
+
+	logFontSize      = 92
+	logFontHeightPos = 0
+	logFontWeightPos = 16
+)
+
+// rgb makes a COLORREF value.
+func rgb(r, g, b uint32) uintptr { return uintptr(r | g<<8 | b<<16) }
+
+// drawItem is DRAWITEMSTRUCT.
+type drawItem struct {
+	ctlType    uint32
+	ctlID      uint32
+	itemID     uint32
+	itemAction uint32
+	itemState  uint32
+	hwndItem   uintptr
+	hdc        uintptr
+	rcItem     rect
+	itemData   uintptr
+}
+
+// initCommonControls loads version 6 of the common controls, which gives
+// the buttons and the list the current Windows look. The program manifest
+// selects that version.
+func initCommonControls() {
+	init := struct{ size, icc uint32 }{8, iccStandardClasses}
+	procInitCommonControlsEx.Call(uintptr(unsafe.Pointer(&init)))
+}
+
+func solidBrush(color uintptr) uintptr {
+	brush, _, _ := procCreateSolidBrush.Call(color)
+	return brush
+}
+
+// messageFonts returns the dialog font of Windows and two variants of it:
+// a semibold font and a large semibold font for the headline.
+func messageFonts() (normal, bold, title uintptr) {
+	var metrics [nonClientMetricsSize]byte
+	*(*uint32)(unsafe.Pointer(&metrics[0])) = nonClientMetricsSize
+	ok, _, _ := procSystemParametersInfoW.Call(spiGetNonClientMetrics, nonClientMetricsSize, uintptr(unsafe.Pointer(&metrics[0])), 0)
+	stock, _, _ := procGetStockObject.Call(defaultGUIFont)
+	if ok == 0 {
+		return stock, stock, stock
+	}
+	logFont := metrics[nonClientMessageFontPos : nonClientMessageFontPos+logFontSize]
+	create := func(scalePercent int32, weight int32) uintptr {
+		var copyFont [logFontSize]byte
+		copy(copyFont[:], logFont)
+		height := (*int32)(unsafe.Pointer(&copyFont[logFontHeightPos]))
+		*height = *height * scalePercent / 100
+		if weight != 0 {
+			*(*int32)(unsafe.Pointer(&copyFont[logFontWeightPos])) = weight
+		}
+		font, _, _ := procCreateFontIndirectW.Call(uintptr(unsafe.Pointer(&copyFont[0])))
+		if font == 0 {
+			return stock
+		}
+		return font
+	}
+	return create(100, 0), create(105, 600), create(150, 600)
+}
+
+func drawText(hdc uintptr, text string, r rect, font, color uintptr) {
+	procSelectObject.Call(hdc, font)
+	procSetTextColor.Call(hdc, color)
+	utf16, err := windows.UTF16FromString(text)
+	if err != nil || len(utf16) < 2 {
+		return
+	}
+	procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(&utf16[0])), uintptr(len(utf16)-1),
+		uintptr(unsafe.Pointer(&r)), dtSingleLine|dtNoPrefix|dtEndEllipsis)
 }
