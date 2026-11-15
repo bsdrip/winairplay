@@ -231,10 +231,12 @@ func TestAnnexBAccessUnitReaderRepeatsParameterSets(t *testing.T) {
 	var stream []byte
 	for _, nal := range [][]byte{
 		hevcNAL(32, 1), hevcNAL(33, 2), hevcNAL(34, 3), hevcNAL(19, firstSlice), // key frame with sets
-		hevcNAL(1, firstSlice),  // normal frame
-		hevcNAL(19, firstSlice), // key frame without sets
+		hevcNAL(1, firstSlice),                  // normal frame
+		hevcNAL(19, firstSlice),                 // key frame without sets
 		hevcNAL(34, 9), hevcNAL(20, firstSlice), // key frame with a new PPS only
-		hevcNAL(1, firstSlice), // closes the frame before
+		// The parser gives a NAL unit when the next one starts, so two
+		// more units are necessary to close the frame before.
+		hevcNAL(1, firstSlice), hevcNAL(1, firstSlice),
 	} {
 		stream = append(stream, nal...)
 	}
