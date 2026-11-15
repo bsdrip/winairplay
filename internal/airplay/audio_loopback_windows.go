@@ -25,6 +25,7 @@ var (
 	clsidMMDeviceEnumerator = windows.GUID{Data1: 0xBCDE0395, Data2: 0xE52F, Data3: 0x467C, Data4: [8]byte{0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}}
 	iidIMMDeviceEnumerator  = windows.GUID{Data1: 0xA95664D2, Data2: 0x9614, Data3: 0x4F35, Data4: [8]byte{0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}}
 	iidIAudioClient         = windows.GUID{Data1: 0x1CB9AD4C, Data2: 0xDBFA, Data3: 0x4C32, Data4: [8]byte{0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2}}
+	iidIAudioEndpointVolume = windows.GUID{Data1: 0x5CDF2C82, Data2: 0x841E, Data3: 0x4546, Data4: [8]byte{0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A}}
 	iidIAudioCaptureClient  = windows.GUID{Data1: 0xC8ADBD64, Data2: 0xE71E, Data3: 0x48A0, Data4: [8]byte{0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17}}
 
 	procCoCreateInstance = windows.NewLazySystemDLL("ole32.dll").NewProc("CoCreateInstance")
@@ -40,8 +41,6 @@ const (
 	waveFormatExtensible       = 0xFFFE
 	loopbackBufferHNS          = 200 * 10000 // 200 ms in units of 100 ns
 	loopbackPollInterval       = 10 * time.Millisecond
-	loopbackSilenceAfter       = 40 * time.Millisecond
-	loopbackSilenceMargin      = 20 * time.Millisecond
 	loopbackReopenInterval     = time.Second
 
 	// Indexes into the COM method tables. The first three are IUnknown.
@@ -56,6 +55,8 @@ const (
 	captureClientGetBuffer            = 3
 	captureClientReleaseBuffer        = 4
 	captureClientGetNextPacketSize    = 5
+	endpointVolumeSetMute             = 14
+	endpointVolumeGetMute             = 15
 )
 
 // comCall calls method number index of a COM object. It returns the HRESULT.
@@ -83,11 +84,41 @@ func hresult(operation string, hr int32) error {
 type loopbackStream struct {
 	client  unsafe.Pointer // IAudioClient
 	capture unsafe.Pointer // IAudioCaptureClient
+	volume  unsafe.Pointer // IAudioEndpointVolume, nil if not available
 	format  pcmSourceFormat
 	started bool
+	// mutedByUs: this program muted the device, and it was not muted before.
+	mutedByUs bool
+}
+
+// setDeviceMuted mutes the playback device, or removes a mute that this
+// program made. It does not remove a mute that the user made.
+func (s *loopbackStream) setDeviceMuted(mute bool) {
+	if s.volume == nil || mute == s.mutedByUs {
+		return
+	}
+	if mute {
+		var already int32
+		if hr := comCall(s.volume, endpointVolumeGetMute, uintptr(unsafe.Pointer(&already))); hr < 0 || already != 0 {
+			return
+		}
+		if hr := comCall(s.volume, endpointVolumeSetMute, 1, 0); hr < 0 {
+			log.Printf("[AUDIO] could not mute the playback device (HRESULT 0x%08X)", uint32(hr))
+			return
+		}
+		s.mutedByUs = true
+		log.Printf("[AUDIO] muted the playback device of the PC")
+		return
+	}
+	comCall(s.volume, endpointVolumeSetMute, 0, 0)
+	s.mutedByUs = false
+	log.Printf("[AUDIO] removed the mute of the playback device")
 }
 
 func (s *loopbackStream) close() {
+	s.setDeviceMuted(false)
+	comRelease1(s.volume)
+	s.volume = nil
 	if s.started {
 		comCall(s.client, audioClientStop)
 	}
@@ -139,6 +170,10 @@ func openLoopbackStream() (*loopbackStream, error) {
 	stream := &loopbackStream{}
 	if hr := comCall(device, deviceActivate, uintptr(unsafe.Pointer(&iidIAudioClient)), clsctxAll, 0, uintptr(unsafe.Pointer(&stream.client))); hr < 0 || stream.client == nil {
 		return nil, hresult("open the playback device", hr)
+	}
+	// The volume interface is optional: it is used only to mute the PC.
+	if hr := comCall(device, deviceActivate, uintptr(unsafe.Pointer(&iidIAudioEndpointVolume)), clsctxAll, 0, uintptr(unsafe.Pointer(&stream.volume))); hr < 0 {
+		stream.volume = nil
 	}
 	var waveFormat unsafe.Pointer
 	if hr := comCall(stream.client, audioClientGetMixFormat, uintptr(unsafe.Pointer(&waveFormat))); hr < 0 || waveFormat == nil {
@@ -238,9 +273,9 @@ func runLoopbackCapture(ctx context.Context, out io.Writer, ready chan<- error) 
 
 	resampler := newStereoResampler(stream.format.sampleRate)
 	sourceRate := stream.format.sampleRate
+	clock := newRealtimeFrameClock(sourceRate, time.Now())
 	var stereo []float32
 	var pcm []byte
-	lastData := time.Now()
 	lastOpenAttempt := time.Now()
 	ticker := time.NewTicker(loopbackPollInterval)
 	defer ticker.Stop()
@@ -251,9 +286,11 @@ func runLoopbackCapture(ctx context.Context, out io.Writer, ready chan<- error) 
 			return nil
 		case <-ticker.C:
 		}
+		mode := currentAudioOutputMode()
 		stereo = stereo[:0]
 		frames := 0
 		if stream != nil {
+			stream.setDeviceMuted(mode == AudioOutputReceiverOnly)
 			var readErr error
 			stereo, frames, readErr = stream.readPackets(stereo)
 			if readErr != nil {
@@ -268,24 +305,29 @@ func runLoopbackCapture(ctx context.Context, out io.Writer, ready chan<- error) 
 			if reopened, openErr := openLoopbackStream(); openErr == nil {
 				stream = reopened
 				if stream.format.sampleRate != sourceRate {
+					// Bring the frame count to the new rate.
+					clock.delivered = clock.delivered * int64(stream.format.sampleRate) / int64(sourceRate)
 					sourceRate = stream.format.sampleRate
+					clock.rate = sourceRate
 					resampler = newStereoResampler(sourceRate)
 				}
 				log.Printf("[AUDIO] capturing the PC sound again: %d Hz, %d channels", sourceRate, stream.format.channels)
 			}
 		}
-		now := time.Now()
-		if frames > 0 {
-			lastData = now
-		} else if gap := now.Sub(lastData); gap >= loopbackSilenceAfter {
-			// No sound came: write silence up to a short time before now.
-			fill := gap - loopbackSilenceMargin
-			silentFrames := int(fill * time.Duration(sourceRate) / time.Second)
-			stereo = append(stereo, make([]float32, 2*silentFrames)...)
-			lastData = now.Add(-loopbackSilenceMargin)
+		// Keep exactly one second of sound in each second: add silence for
+		// the times without data, discard what a fast device gives too much.
+		pad, drop := clock.adjust(time.Now(), frames)
+		if drop > 0 {
+			stereo = stereo[2*drop:]
+		}
+		if pad > 0 {
+			stereo = append(stereo, make([]float32, 2*pad)...)
 		}
 		if len(stereo) == 0 {
 			continue
+		}
+		if mode == AudioOutputPCOnly {
+			clear(stereo)
 		}
 		pcm = resampler.process(pcm[:0], stereo)
 		if len(pcm) > 0 {

@@ -44,7 +44,7 @@ A changed setting applies to the next session.
 | Video encoder | **Automatic** is correct for most computers. Select NVIDIA, Intel or AMD to force one graphics card encoder. |
 | Frame rate | 15, 30 or 60 frames per second. |
 | Show the mouse pointer | Includes the pointer in the picture. |
-| Send the sound of the PC | Sends what the PC plays to the TV. |
+| Sound | Selects the TV, the PC, or the two. See [Sound](#sound). |
 | Write a detailed log | Adds the protocol messages to the log file. |
 | Open the log file | Opens `%LocalAppData%\winairplay\winairplay.log`. |
 
@@ -63,10 +63,20 @@ If 4K cannot start, winairplay shows a notice and uses 1080p.
 
 ### Sound
 
-winairplay sends the sound that the PC plays on its default output device.
-The PC speakers continue to play. Mute them if you want sound only from the
-TV: use the mute key of the speakers or monitor, because the Windows volume
-control can also change the sound that goes to the TV.
+The **Sound** menu selects where you hear the sound of the PC. You can
+change it during mirroring; the change is immediate.
+
+| Selection | Result |
+| --- | --- |
+| TV and this PC | The TV and the PC (headphones or speakers) play the sound. |
+| TV only (mutes this PC) | The TV plays the sound. winairplay mutes the output device of the PC and removes the mute when you change the selection or stop mirroring. |
+| This PC only | Only the PC plays the sound. The TV is silent. |
+
+winairplay sends the sound of the default output device of Windows.
+
+With some audio drivers, a muted device gives no sound to winairplay. If
+the TV is silent with **TV only**, select **TV and this PC** and decrease
+the volume at the headphones or speakers.
 
 ## Troubleshooting
 
@@ -77,7 +87,8 @@ control can also change the sound that goes to the TV.
 | The session stops after some seconds | Allow `winairplay.exe` in Windows Firewall for private networks. |
 | Notice "4K is not available" | Read the reason in the notice. See [4K](#4k). |
 | The 4K picture stutters | Select 30 frames per second, use a network cable, or select **1080p**. |
-| No sound | Make sure that **Send the sound of the PC** has a check mark and that the sound plays on the default output device of Windows. |
+| No sound on the TV | In the **Sound** menu, select **TV and this PC**. Make sure that the sound plays on the default output device of Windows. |
+| The PC stays muted after winairplay was stopped by force | Remove the mute with the Windows volume control. |
 | The picture is black for protected video | Windows does not let programs capture DRM-protected video. This is normal. |
 
 For other problems, select **Write a detailed log**, repeat the steps, and

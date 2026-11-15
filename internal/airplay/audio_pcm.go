@@ -12,7 +12,82 @@ import (
 	"io"
 	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// AudioOutputMode selects where the sound of the PC is heard during
+// mirroring. It can change while a session runs.
+type AudioOutputMode int32
+
+const (
+	// AudioOutputBoth: the receiver and the PC play the sound.
+	AudioOutputBoth AudioOutputMode = iota
+	// AudioOutputReceiverOnly: the receiver plays the sound and the output
+	// device of the PC is muted.
+	AudioOutputReceiverOnly
+	// AudioOutputPCOnly: the receiver gets silence.
+	AudioOutputPCOnly
+)
+
+var audioOutputMode atomic.Int32
+
+// SetAudioOutputMode changes the sound output. A running capture applies it
+// in less than 0.1 seconds.
+func SetAudioOutputMode(mode AudioOutputMode) {
+	if mode < AudioOutputBoth || mode > AudioOutputPCOnly {
+		mode = AudioOutputBoth
+	}
+	audioOutputMode.Store(int32(mode))
+}
+
+func currentAudioOutputMode() AudioOutputMode {
+	return AudioOutputMode(audioOutputMode.Load())
+}
+
+// realtimeFrameClock keeps the number of captured frames equal to the time
+// that passed. The AirPlay audio sender has no time stamps from Windows, so
+// it must get exactly one second of sound in each second. An audio device
+// gives no data while nothing plays, and its clock is not exactly the clock
+// of the PC. Without a correction the sound moves away from real time, and
+// the receiver discards it as too late.
+type realtimeFrameClock struct {
+	rate      int
+	start     time.Time
+	delivered int64
+}
+
+const (
+	realtimeFrameTolerance = 40 * time.Millisecond
+	realtimeFrameFillLag   = 20 * time.Millisecond
+)
+
+func newRealtimeFrameClock(rate int, now time.Time) *realtimeFrameClock {
+	return &realtimeFrameClock{rate: rate, start: now}
+}
+
+func (c *realtimeFrameClock) frames(d time.Duration) int64 {
+	return int64(d) * int64(c.rate) / int64(time.Second)
+}
+
+// adjust is called with the number of frames that the device gave since the
+// last call. It returns how many silent frames to add after them (pad), or
+// how many of them to discard (drop), so that the total follows the time.
+func (c *realtimeFrameClock) adjust(now time.Time, got int) (pad, drop int) {
+	target := c.frames(now.Sub(c.start))
+	total := c.delivered + int64(got)
+	switch tolerance := c.frames(realtimeFrameTolerance); {
+	case total < target-tolerance:
+		pad = int(target - c.frames(realtimeFrameFillLag) - total)
+	case total > target+tolerance:
+		drop = got
+		if excess := total - target; excess < int64(got) {
+			drop = int(excess)
+		}
+	}
+	c.delivered = total + int64(pad) - int64(drop)
+	return pad, drop
+}
 
 // pcmSourceFormat describes interleaved PCM as an audio device gives it.
 type pcmSourceFormat struct {

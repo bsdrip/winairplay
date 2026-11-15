@@ -44,7 +44,7 @@ const (
 	idOpenLog   = 4
 	idExit      = 5
 	idCursor    = 6
-	idSound     = 7
+	idSound     = 400 // + airplay.AudioOutputMode
 	idDebugLog  = 8
 	idPicture4K = 9
 	idPictureHD = 10
@@ -66,6 +66,13 @@ var encoderChoices = []struct{ value, label string }{
 
 var fpsChoices = []int{15, 30, 60}
 
+// soundLabels has one menu text for each airplay.AudioOutputMode.
+var soundLabels = []string{
+	"TV and this PC",
+	"TV only (mutes this PC)",
+	"This PC only (headphones or speakers)",
+}
+
 // settings are saved in %AppData%\winairplay\settings.json.
 type settings struct {
 	Encoder    string `json:"encoder"`
@@ -74,7 +81,10 @@ type settings struct {
 	HideCursor bool   `json:"hideCursor"`
 	// Picture1080p selects H.264 at 1080p. The default is 4K (HEVC).
 	Picture1080p bool `json:"picture1080p"`
-	NoSound      bool `json:"noSound"`
+	// SoundMode: 0 = TV and PC, 1 = TV only (mutes the PC), 2 = PC only.
+	SoundMode int `json:"soundMode"`
+	// NoSound is the setting of version 0.2. It is read as SoundMode 2.
+	NoSound bool `json:"noSound,omitempty"`
 	DebugLog     bool `json:"debugLog"`
 }
 
@@ -99,6 +109,13 @@ func loadSettings() settings {
 	}
 	if s.Display < 0 || s.Display >= maxDisplays {
 		s.Display = 0
+	}
+	if s.NoSound {
+		s.NoSound = false
+		s.SoundMode = int(airplay.AudioOutputPCOnly)
+	}
+	if s.SoundMode < 0 || s.SoundMode > int(airplay.AudioOutputPCOnly) {
+		s.SoundMode = 0
 	}
 	return s
 }
@@ -161,6 +178,7 @@ func main() {
 	theApp = a
 	a.logPath = setupLog()
 	airplay.SetDebugMode(a.settings.DebugLog)
+	airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
 	log.Printf("%s %s started", appName, version)
 
 	if err := a.createWindows(); err != nil {
@@ -439,7 +457,11 @@ func (a *app) showMenu() {
 		cursorFlags |= mfChecked
 	}
 	appendMenu(menu, cursorFlags, idCursor, "Show the mouse pointer")
-	appendMenu(menu, checked(!a.settings.NoSound), idSound, "Send the sound of the PC")
+	soundMenu := createPopupMenu()
+	for mode, label := range soundLabels {
+		appendMenu(soundMenu, checked(a.settings.SoundMode == mode), uintptr(idSound+mode), label)
+	}
+	appendMenu(menu, mfPopup, soundMenu, "Sound")
 	appendMenu(menu, mfSeparator, 0, "")
 	appendMenu(menu, checked(a.settings.DebugLog), idDebugLog, "Write a detailed log")
 	appendMenu(menu, mfString, idOpenLog, "Open the log file")
@@ -479,15 +501,18 @@ func (a *app) onCommand(cmd int, devices []airplay.AirPlayDevice) {
 	case cmd == idCursor:
 		a.settings.HideCursor = !a.settings.HideCursor
 		settingsChanged()
-	case cmd == idSound:
-		a.settings.NoSound = !a.settings.NoSound
-		settingsChanged()
+	case cmd >= idSound && cmd < idSound+len(soundLabels):
+		// The sound output changes immediately, also during mirroring.
+		a.settings.SoundMode = cmd - idSound
+		airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
+		a.settings.save()
 	case cmd == idPicture4K, cmd == idPictureHD:
 		a.settings.Picture1080p = cmd == idPictureHD
 		settingsChanged()
 	case cmd == idDebugLog:
 		a.settings.DebugLog = !a.settings.DebugLog
 		airplay.SetDebugMode(a.settings.DebugLog)
+	airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
 		a.settings.save()
 	case cmd >= idDevice && cmd < idDevice+len(devices):
 		a.startSession(devices[cmd-idDevice])
@@ -679,7 +704,6 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 		HideCursor: a.settings.HideCursor,
 
 		HighResolution: !a.settings.Picture1080p,
-		NoSound:        a.settings.NoSound,
 	}
 	ui := mirror.UI{
 		AskCredential: func(prompt mirror.Prompt, receiver string) (string, bool) {

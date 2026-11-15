@@ -370,7 +370,8 @@ func ffmpegEncoderArgs(encoder ffmpegEncoder, bitrate, fps int) []string {
 		args = append([]string{"-c:v", "hevc_qsv", "-preset", "veryfast", "-async_depth", "1", "-profile:v", "main"}, rate...)
 		args = append(args, vbvArgs...)
 	case "hevc_amf":
-		args = append([]string{"-c:v", "hevc_amf", "-usage", "ultralowlatency", "-rc", "cbr"}, rate...)
+		// header_insertion_mode idr: VPS, SPS and PPS before each IDR frame.
+		args = append([]string{"-c:v", "hevc_amf", "-usage", "ultralowlatency", "-rc", "cbr", "-header_insertion_mode", "idr"}, rate...)
 	case "hevc_mf":
 		args = append([]string{"-c:v", "hevc_mf", "-rate_control", "cbr", "-scenario", "display_remoting"}, rate...)
 	}

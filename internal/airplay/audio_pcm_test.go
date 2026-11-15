@@ -151,3 +151,84 @@ func TestPCMQueueDiscardsOldSoundAndReportsTheEnd(t *testing.T) {
 		t.Error("Write after Close must fail")
 	}
 }
+
+// simulateFrameClock runs the clock for a time with a device that gives
+// deviceRate frames in each second while playing is true, in 10 ms steps.
+func simulateFrameClock(t *testing.T, seconds int, deviceRate float64, playing func(step int) bool) (delivered int64, worst time.Duration) {
+	t.Helper()
+	const rate = 48000
+	start := time.Unix(5000, 0)
+	clock := newRealtimeFrameClock(rate, start)
+	var deviceFrames float64
+	var given int64
+	for step := 1; step <= seconds*100; step++ {
+		now := start.Add(time.Duration(step) * 10 * time.Millisecond)
+		got := 0
+		if playing(step) {
+			deviceFrames += deviceRate / 100
+			got = int(int64(deviceFrames) - given)
+			given += int64(got)
+		}
+		pad, drop := clock.adjust(now, got)
+		if pad < 0 || drop < 0 || drop > got {
+			t.Fatalf("step %d: pad %d, drop %d for %d frames", step, pad, drop, got)
+		}
+		delivered += int64(got + pad - drop)
+		behind := now.Sub(start) - time.Duration(delivered)*time.Second/rate
+		if behind < 0 {
+			behind = -behind
+		}
+		worst = max(worst, behind)
+	}
+	return delivered, worst
+}
+
+func TestRealtimeFrameClockFollowsTheTime(t *testing.T) {
+	cases := []struct {
+		name       string
+		deviceRate float64
+		playing    func(step int) bool
+	}{
+		{"continuous sound", 48000, func(int) bool { return true }},
+		{"no sound at all", 48000, func(int) bool { return false }},
+		// Sound that starts and stops each 0.7 seconds.
+		{"sound with pauses", 48000, func(step int) bool { return (step/70)%2 == 0 }},
+		{"device clock 0.1 percent slow", 47952, func(int) bool { return true }},
+		{"device clock 0.1 percent fast", 48048, func(int) bool { return true }},
+	}
+	for _, tc := range cases {
+		delivered, worst := simulateFrameClock(t, 600, tc.deviceRate, tc.playing)
+		// In 10 minutes the sound must stay within 50 ms of real time.
+		if worst > 50*time.Millisecond {
+			t.Errorf("%s: sound was %v away from real time", tc.name, worst)
+		}
+		if want := int64(600 * 48000); delivered < want-2400 || delivered > want+2400 {
+			t.Errorf("%s: %d frames in 600 seconds, want %d", tc.name, delivered, want)
+		}
+	}
+}
+
+func TestRealtimeFrameClockDoesNotChangeGoodSound(t *testing.T) {
+	// A device with a correct clock that delivers 10 ms late gets no change.
+	const rate = 44100
+	start := time.Unix(100, 0)
+	clock := newRealtimeFrameClock(rate, start)
+	for step := 2; step <= 3000; step++ {
+		now := start.Add(time.Duration(step) * 10 * time.Millisecond)
+		if pad, drop := clock.adjust(now, 441); pad != 0 || drop != 0 {
+			t.Fatalf("step %d: pad %d, drop %d; want no change", step, pad, drop)
+		}
+	}
+}
+
+func TestSetAudioOutputMode(t *testing.T) {
+	defer SetAudioOutputMode(AudioOutputBoth)
+	SetAudioOutputMode(AudioOutputPCOnly)
+	if currentAudioOutputMode() != AudioOutputPCOnly {
+		t.Error("the mode did not change")
+	}
+	SetAudioOutputMode(AudioOutputMode(99))
+	if currentAudioOutputMode() != AudioOutputBoth {
+		t.Error("a mode that is not valid must select the default")
+	}
+}
