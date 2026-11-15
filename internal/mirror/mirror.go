@@ -68,6 +68,10 @@ type UI struct {
 	// Streaming is called one time, when video starts to flow. detail
 	// describes the stream, for example "3840 x 2160 HEVC".
 	Streaming func(receiver, detail string)
+	// Identified is called after the receiver answered, with its name, model
+	// and device ID. A device that the user gave as an address has only an
+	// IP address before this call.
+	Identified func(device airplay.AirPlayDevice)
 	// Notice reports a problem that does not stop the session, for example
 	// that the receiver cannot do 4K and the session uses 1080p.
 	Notice func(message string)
@@ -358,6 +362,19 @@ func run(parent context.Context, device airplay.AirPlayDevice, opts Options, ui 
 		return stage, err
 	}
 	log.Printf("connected to %s (model %s)", s.info.Name, s.info.Model)
+	if ui.Identified != nil {
+		identified := device
+		if s.info.Name != "" {
+			identified.Name = s.info.Name
+		}
+		if s.info.Model != "" {
+			identified.Model = s.info.Model
+		}
+		if s.info.DeviceID != "" {
+			identified.DeviceID = s.info.DeviceID
+		}
+		ui.Identified(identified)
+	}
 	if s.credential == "" && s.info.RequiresPassword() {
 		if s.credential, err = s.ask(PromptPassword); err != nil {
 			return stage, err

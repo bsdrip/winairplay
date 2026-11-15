@@ -1,8 +1,7 @@
 # winairplay
 
-winairplay mirrors the screen and the sound of a Windows PC to an Apple TV
-with the AirPlay protocol. It runs as an icon in the notification area of the
-taskbar.
+winairplay mirrors the screen and the sound of a Windows PC to an Apple TV,
+or to a TV that can receive AirPlay.
 
 ## Install
 
@@ -17,28 +16,42 @@ winairplay uses to capture and encode the screen.
 
 ## Use
 
-1. Click the screen icon in the notification area. If you do not see it,
-   click the arrow (`^`) next to the clock.
+1. Start **winairplay** from the Start menu or the Windows search. The
+   window shows the AirPlay receivers on your network and the receivers
+   that you used before.
 2. When Windows Firewall asks, allow access on private networks.
-3. Click **Mirror to _name of your Apple TV_**.
+3. Select a device and click **Connect**. A double-click on the device does
+   the same.
 4. The first time, the Apple TV shows a PIN. Type it into the window that
    winairplay opens.
-5. The icon becomes blue when mirroring is active. The first line of the menu
-   shows the picture size, for example `3840 x 2160 HEVC`.
-6. To stop, click the icon and click **Stop mirroring**.
+5. The first line of the window shows the state, for example
+   `Mirroring to Living Room (3840 x 2160 HEVC)`.
+6. To stop, click **Disconnect**.
 
-winairplay searches the network for receivers continuously (mDNS). If that
-finds nothing, it also tries each address of the local network on the AirPlay
-port.
+If you close the window, winairplay continues to run. Its icon stays in the
+notification area of the taskbar (click the arrow `^` next to the clock if
+you do not see it). Click the icon to open the window again. Right-click the
+icon for a menu with the same functions and **Exit**.
 
-### Menu
+### Devices
 
-A changed setting applies to the next session.
+- winairplay searches the network for receivers continuously (mDNS). If that
+  finds nothing, it also tries each address of the local network on the
+  AirPlay port.
+- winairplay saves each receiver that mirroring operated with. A saved
+  receiver stays in the list when the search does not find it, with the
+  text "saved, not found now". You can connect to it in the usual way.
+- **Forget** removes the selected receiver from the saved list.
+- **Add by IP address...** connects to an address that you type.
+
+### Settings
+
+The **Settings** button and the menu of the tray icon have these items. A
+changed setting applies to the next session; a change of **Sound** is
+immediate.
 
 | Menu item | Function |
 | --- | --- |
-| Mirror to an IP address... | Connects to an address that you type. |
-| Search again | Searches for receivers immediately. |
 | Display | Selects the monitor (only with more than one monitor). |
 | Picture | **4K**: HEVC video at up to 3840 x 2160. **1080p**: H.264 video. |
 | Video encoder | **Automatic** is correct for most computers. Select NVIDIA, Intel or AMD to force one graphics card encoder. |
@@ -82,7 +95,7 @@ the volume at the headphones or speakers.
 
 | Symptom | Possible cause and remedy |
 | --- | --- |
-| The receiver list is empty | Click **Search again**. If the list stays empty, use **Mirror to an IP address...**. Some guest and corporate networks isolate the devices from each other. |
+| The device list is empty | Click **Search again**. If the list stays empty, use **Add by IP address...**. Some guest and corporate networks isolate the devices from each other. |
 | Pairing fails | On the Apple TV, open Settings > AirPlay and HomeKit. Set **Allow Access** to "Anyone on the Same Network". Then try again. |
 | The session stops after some seconds | Allow `winairplay.exe` in Windows Firewall for private networks. |
 | Notice "4K is not available" | Read the reason in the notice. See [4K](#4k). |
@@ -110,9 +123,10 @@ a release, push a tag: `git tag v1.2.3` and `git push origin v1.2.3`.
 
 | Item | Status |
 | --- | --- |
-| Mirroring from Windows to a real Apple TV, 1080p H.264 | Confirmed by a user with version 0.1. |
-| 4K HEVC, sound, network scan | Automated tests pass against a software test receiver. Not yet confirmed with a real Apple TV. |
-| Hardware HEVC encoders (NVIDIA, Intel, AMD) | Not tested: the build servers have no graphics card. |
+| Mirroring from Windows to an Apple TV 4K: 4K HEVC with the AMD encoder, sound | Confirmed by a user with version 0.3.1. |
+| NVIDIA and Intel HEVC encoders | Not tested: the build servers have no graphics card. |
+| Sessions, network scan | Automated tests against a software test receiver, on Linux and Windows. |
+| Main window | Each build starts the program and makes a picture of the window. |
 | Installer | Each build installs, starts and uninstalls the program on Windows. |
 
 Run the tests with `go test ./...` on Linux. The session tests need FFmpeg
@@ -131,7 +145,7 @@ doubletake and need Linux.
 | --- | --- |
 | `internal/airplay` | AirPlay protocol (from doubletake), FFmpeg capture and sound capture. |
 | `internal/mirror` | One mirroring session, and the search for receivers. |
-| `cmd/winairplay` | Tray application (Win32 API, no GUI library). |
+| `cmd/winairplay` | The application: main window and tray icon (Win32 API, no GUI library). |
 | `cmd/winairplay-test-receiver` | Software receiver for tests (from doubletake). It is not in the installer. |
 | `installer` | Inno Setup script and icon. |
 

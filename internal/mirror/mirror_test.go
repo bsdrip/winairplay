@@ -36,8 +36,9 @@ type loopbackReceiver struct {
 	opts   Options
 	pin    string
 	// detail and notices are from the last session.
-	detail  string
-	notices []string
+	detail     string
+	notices    []string
+	identified airplay.AirPlayDevice
 }
 
 func startLoopbackReceiver(t *testing.T, profile airplay.ReceiverProfile, auth airplay.ReceiverAuthMode, pin string) *loopbackReceiver {
@@ -87,8 +88,9 @@ func (r *loopbackReceiver) runSession(t *testing.T, name string, wantPrompts int
 			prompts.Add(1)
 			return r.pin, true
 		},
-		Streaming: func(_, detail string) { r.detail = detail; streaming <- struct{}{} },
-		Notice:    func(message string) { r.notices = append(r.notices, message) },
+		Streaming:  func(_, detail string) { r.detail = detail; streaming <- struct{}{} },
+		Notice:     func(message string) { r.notices = append(r.notices, message) },
+		Identified: func(device airplay.AirPlayDevice) { r.identified = device },
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -144,6 +146,9 @@ func TestRunAgainstModernReceiver(t *testing.T) {
 	receiver := startLoopbackReceiver(t, airplay.ReceiverProfileModern, airplay.ReceiverAuthPIN, "4821")
 	packets := func(s airplay.ReceiverStats) uint64 { return s.VideoPackets }
 	receiver.runSession(t, "first session", 1, packets)
+	if id := receiver.identified; id.Name == "" || id.Model != "AppleTV14,1" || id.DeviceID == "" || id.IP != receiver.device.IP {
+		t.Errorf("identified device = %+v, want name, model and device ID of the receiver", id)
+	}
 	if receiver.detail != "1920 x 1080 H264" {
 		t.Errorf("first session streams %q, want 1920 x 1080 H264", receiver.detail)
 	}

@@ -1,7 +1,8 @@
 //go:build windows
 
-// winairplay is a Windows tray application that mirrors the screen to an
-// Apple TV or another AirPlay receiver.
+// winairplay mirrors the screen and the sound of a Windows PC to an Apple TV
+// or another AirPlay receiver. It has a main window and an icon in the
+// notification area of the taskbar.
 package main
 
 import (
@@ -31,27 +32,30 @@ import (
 var version = "dev"
 
 const (
-	appName = "winairplay"
+	appName       = "winairplay"
+	mainClassName = "WinAirPlayMain"
 
 	wmTray   = wmApp + 1 // message from the tray icon
 	wmUICall = wmApp + 2 // run queued functions on the UI thread
 
 	trayIconID = 1
 
-	idStop      = 1
-	idRefresh   = 2
-	idManualIP  = 3
-	idOpenLog   = 4
-	idExit      = 5
-	idCursor    = 6
-	idSound     = 400 // + airplay.AudioOutputMode
-	idDebugLog  = 8
-	idPicture4K = 9
-	idPictureHD = 10
+	// Menu commands. Numbers 1 and 2 are IDOK and IDCANCEL in the window.
+	idStop      = 11
+	idRefresh   = 12
+	idManualIP  = 13
+	idOpenLog   = 14
+	idExit      = 15
+	idCursor    = 16
+	idDebugLog  = 18
+	idPicture4K = 19
+	idPictureHD = 20
+	idOpenUI    = 21
 	idEncoder   = 100  // + index in encoderChoices
 	idFPS       = 200  // + index in fpsChoices
 	idDisplay   = 300  // + zero-based display index
-	idDevice    = 1000 // + index in the device list
+	idSound     = 400  // + airplay.AudioOutputMode
+	idDevice    = 1000 // + index in the device rows
 	maxDevices  = 200
 	maxDisplays = 16
 )
@@ -73,6 +77,20 @@ var soundLabels = []string{
 	"This PC only (headphones or speakers)",
 }
 
+// knownDevice is a receiver that mirroring operated with before.
+type knownDevice struct {
+	Name     string `json:"name"`
+	Model    string `json:"model,omitempty"`
+	IP       string `json:"ip"`
+	Port     int    `json:"port"`
+	DeviceID string `json:"deviceID,omitempty"`
+	LastUsed string `json:"lastUsed,omitempty"` // RFC 3339
+}
+
+func (k knownDevice) device() airplay.AirPlayDevice {
+	return airplay.AirPlayDevice{Name: k.Name, Model: k.Model, IP: k.IP, Port: k.Port, DeviceID: k.DeviceID}
+}
+
 // settings are saved in %AppData%\winairplay\settings.json.
 type settings struct {
 	Encoder    string `json:"encoder"`
@@ -84,8 +102,9 @@ type settings struct {
 	// SoundMode: 0 = TV and PC, 1 = TV only (mutes the PC), 2 = PC only.
 	SoundMode int `json:"soundMode"`
 	// NoSound is the setting of version 0.2. It is read as SoundMode 2.
-	NoSound  bool `json:"noSound,omitempty"`
-	DebugLog bool `json:"debugLog"`
+	NoSound  bool          `json:"noSound,omitempty"`
+	DebugLog bool          `json:"debugLog"`
+	Known    []knownDevice `json:"knownDevices,omitempty"`
 }
 
 func settingsPath() string {
@@ -117,6 +136,13 @@ func loadSettings() settings {
 	if s.SoundMode < 0 || s.SoundMode > int(airplay.AudioOutputPCOnly) {
 		s.SoundMode = 0
 	}
+	known := s.Known[:0]
+	for _, k := range s.Known {
+		if k.IP != "" && k.Port > 0 && k.Port < 65536 {
+			known = append(known, k)
+		}
+	}
+	s.Known = known
 	return s
 }
 
@@ -139,22 +165,37 @@ type activeSession struct {
 	done   chan struct{}
 }
 
+// deviceRow is one line of the device list.
+type deviceRow struct {
+	device airplay.AirPlayDevice
+	found  bool // the last searches found it
+	known  bool // it is in the saved list
+	active bool // the session uses it
+}
+
 type app struct {
 	hwnd           uintptr
 	iconIdle       uintptr
 	iconActive     uintptr
 	taskbarCreated uint32
+	showUIMessage  uint32
 	logPath        string
+	dpi            int32
+	font           uintptr
+	window         mainWindow
 
 	// The fields below are used only on the UI thread.
-	settings  settings
-	devices   []airplay.AirPlayDevice
-	missed    map[string]int // scans in a row that did not find a device
-	searching bool
-	session   *activeSession
-	streaming bool
-	status    string
-	dialog    *promptDialog
+	settings settings
+	devices  []airplay.AirPlayDevice // found by the search
+	missed   map[string]int          // searches in a row that did not find a device
+	rows     []deviceRow
+	// renderedKeys has the device key of each line that the list box shows.
+	renderedKeys []string
+	searching    bool
+	session      *activeSession
+	streaming    bool
+	status       string
+	dialog       *promptDialog
 
 	queueMu sync.Mutex
 	queue   []func()
@@ -164,18 +205,39 @@ type app struct {
 
 var theApp *app
 
+// px converts a length at 100 % display scale to pixels.
+func (a *app) px(v int32) int32 { return v * a.dpi / 96 }
+
 func main() {
 	// Win32 windows belong to the thread that made them.
 	runtime.LockOSThread()
 
+	background := false
+	for _, arg := range os.Args[1:] {
+		if arg == "--background" || arg == "-background" {
+			background = true
+		}
+	}
+
+	showUIMessage := registerWindowMessage("WinAirPlayShowUI")
 	mutexName, _ := windows.UTF16PtrFromString("Local\\winairplay-single-instance")
 	if _, err := windows.CreateMutex(nil, false, mutexName); errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-		messageBox(appName, "winairplay is already running. Look for its icon in the notification area of the taskbar.", mbIconInfo)
+		// winairplay runs already: ask that instance to show its window.
+		if !background {
+			activateRunningInstance(showUIMessage)
+		}
 		return
 	}
 
+	// Without this call Windows scales the window as a bitmap, and the text
+	// is not sharp on a 4K monitor.
+	procSetProcessDPIAware.Call()
+
 	a := &app{settings: loadSettings(), status: "Not connected", refresh: make(chan struct{}, 1)}
 	theApp = a
+	a.showUIMessage = showUIMessage
+	a.dpi = systemDPI()
+	a.font = messageFont()
 	a.logPath = setupLog()
 	airplay.SetDebugMode(a.settings.DebugLog)
 	airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
@@ -187,6 +249,10 @@ func main() {
 		return
 	}
 	a.addTrayIcon()
+	a.rebuildRows()
+	if !background {
+		a.showMainWindow()
+	}
 	go a.discoveryLoop()
 
 	var m msg
@@ -195,10 +261,35 @@ func main() {
 		if int32(r) <= 0 {
 			break
 		}
+		// IsDialogMessage gives the Tab and Enter keys their usual functions
+		// in the main window.
+		if handled, _, _ := procIsDialogMessageW.Call(a.hwnd, uintptr(unsafe.Pointer(&m))); handled != 0 {
+			continue
+		}
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
 		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
 	log.Printf("%s stopped", appName)
+}
+
+func registerWindowMessage(name string) uint32 {
+	r, _, _ := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(u16(name))))
+	return uint32(r)
+}
+
+// activateRunningInstance tells the first instance to show its window.
+func activateRunningInstance(message uint32) {
+	hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(u16(mainClassName))), 0)
+	if hwnd == 0 || message == 0 {
+		messageBox(appName, "winairplay is already running. Look for its icon in the notification area of the taskbar.", mbIconInfo)
+		return
+	}
+	var pid uint32
+	procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	// Windows lets a program come to the foreground only with permission
+	// from the program that has the foreground now.
+	procAllowSetForegroundWindow.Call(uintptr(pid))
+	postMessage(hwnd, message, 0, 0)
 }
 
 // setupLog sends the log to %LocalAppData%\winairplay\winairplay.log. A GUI
@@ -232,19 +323,17 @@ func (a *app) createWindows() error {
 	if a.iconActive == 0 {
 		a.iconActive = a.iconIdle
 	}
-	if err := registerClass("WinAirPlayMain", windows.NewCallback(mainWndProc), a.iconIdle); err != nil {
+	windowIcon := a.iconActive
+	if err := registerClass(mainClassName, windows.NewCallback(mainWndProc), windowIcon); err != nil {
 		return fmt.Errorf("register window class: %w", err)
 	}
-	if err := registerClass(promptClassName, windows.NewCallback(promptWndProc), a.iconIdle); err != nil {
+	if err := registerClass(promptClassName, windows.NewCallback(promptWndProc), windowIcon); err != nil {
 		return fmt.Errorf("register dialog class: %w", err)
 	}
-	// The main window is never shown. It receives the tray icon messages.
-	a.hwnd = createWindow(0, "WinAirPlayMain", appName, wsPopup, 0, 0, 0, 0, 0, 0)
-	if a.hwnd == 0 {
-		return fmt.Errorf("create the main window")
+	if err := a.createMainWindow(); err != nil {
+		return err
 	}
-	r, _, _ := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(u16("TaskbarCreated"))))
-	a.taskbarCreated = uint32(r)
+	a.taskbarCreated = registerWindowMessage("TaskbarCreated")
 	return nil
 }
 
@@ -291,6 +380,7 @@ func (a *app) notify(title, text string, isError bool) {
 func (a *app) setStatus(status string) {
 	a.status = status
 	a.updateTrayIcon()
+	a.refreshWindow()
 }
 
 // ---- UI thread queue ----
@@ -328,101 +418,172 @@ func (a *app) runQueued() {
 	}
 }
 
-func mainWndProc(hwnd, rawMessage, wParam, lParam uintptr) uintptr {
-	a := theApp
-	message := uint32(rawMessage)
-	switch {
-	case a == nil:
-	case message == wmTray:
-		if lParam == wmLButtonUp || lParam == wmRButtonUp {
-			a.showMenu()
-		}
-		return 0
-	case message == wmUICall:
-		a.runQueued()
-		return 0
-	case message == wmDestroy:
-		procPostQuitMessage.Call(0)
-		return 0
-	case a != nil && a.taskbarCreated != 0 && message == a.taskbarCreated:
-		// Explorer started again: the icon must be added again.
-		a.addTrayIcon()
-		return 0
+// ---- device list ----
+
+func deviceKey(d airplay.AirPlayDevice) string {
+	if d.DeviceID != "" {
+		return strings.ToLower(d.DeviceID)
 	}
-	return defWindowProc(hwnd, message, wParam, lParam)
+	return net.JoinHostPort(d.IP, strconv.Itoa(d.Port))
 }
 
-// ---- menu ----
+// modelName makes a model code readable: "AppleTV14,1" becomes "Apple TV".
+func modelName(model string) string {
+	switch {
+	case strings.HasPrefix(model, "AppleTV"):
+		return "Apple TV"
+	case strings.HasPrefix(model, "AudioAccessory"):
+		return "HomePod"
+	case strings.HasPrefix(model, "Mac"), strings.Contains(model, "Mac"):
+		return "Mac"
+	}
+	return model
+}
 
-func deviceLabel(d airplay.AirPlayDevice) string {
+// rowLabel is the text of a device in the window and in the menu.
+func rowLabel(row deviceRow, state string) string {
+	d := row.device
 	name := d.Name
 	if name == "" {
 		name = d.IP
 	}
-	// "&" marks a keyboard shortcut in a menu. Show it as text.
-	return strings.ReplaceAll(name, "&", "&&")
+	details := []string{}
+	if model := modelName(d.Model); model != "" {
+		details = append(details, model)
+	}
+	if d.Name != "" {
+		details = append(details, d.IP)
+	}
+	label := name
+	if len(details) > 0 {
+		label += "  (" + strings.Join(details, ", ") + ")"
+	}
+	switch {
+	case row.active && state != "":
+		label += "  -  " + state
+	case !row.found:
+		label += "  -  saved, not found now"
+	}
+	return label
 }
 
-func (a *app) showMenu() {
-	menu := createPopupMenu()
-	if menu == 0 {
+// rebuildRows makes the device list from the search result and the saved
+// devices. A saved device that the search did not find stays in the list.
+func (a *app) rebuildRows() {
+	var rows []deviceRow
+	matched := make([]bool, len(a.settings.Known))
+	changed := false
+	for _, d := range a.devices {
+		row := deviceRow{device: d, found: true}
+		for i := range a.settings.Known {
+			k := &a.settings.Known[i]
+			if matched[i] || !mirror.SameDevice(k.device(), d) {
+				continue
+			}
+			matched[i] = true
+			row.known = true
+			// The receiver can get a new address or name. Keep the newest.
+			if d.IP != "" && (k.IP != d.IP || k.Port != d.Port || (d.Name != "" && k.Name != d.Name)) {
+				k.IP, k.Port = d.IP, d.Port
+				if d.Name != "" {
+					k.Name = d.Name
+				}
+				changed = true
+			}
+			break
+		}
+		rows = append(rows, row)
+	}
+	for i, k := range a.settings.Known {
+		if !matched[i] {
+			rows = append(rows, deviceRow{device: k.device(), known: true})
+		}
+	}
+	if s := a.session; s != nil {
+		found := false
+		for i := range rows {
+			if mirror.SameDevice(rows[i].device, s.device) {
+				rows[i].active = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			rows = append([]deviceRow{{device: s.device, active: true, found: true}}, rows...)
+		}
+	}
+	if len(rows) > maxDevices {
+		rows = rows[:maxDevices]
+	}
+	a.rows = rows
+	if changed {
+		a.settings.save()
+	}
+	a.refreshWindow()
+}
+
+// rememberDevice puts the receiver of a session that operates into the
+// saved list, as the first entry.
+func (a *app) rememberDevice(d airplay.AirPlayDevice) {
+	if d.IP == "" {
 		return
 	}
-	defer procDestroyMenu.Call(menu)
-
-	appendMenu(menu, mfString|mfGrayed, 0, a.status)
-	appendMenu(menu, mfSeparator, 0, "")
-	checked := func(on bool) uint32 {
-		if on {
-			return mfString | mfChecked
+	entry := knownDevice{Name: d.Name, Model: d.Model, IP: d.IP, Port: d.Port, DeviceID: d.DeviceID,
+		LastUsed: time.Now().Format(time.RFC3339)}
+	known := []knownDevice{entry}
+	for _, k := range a.settings.Known {
+		if !mirror.SameDevice(k.device(), d) && len(known) < 50 {
+			known = append(known, k)
 		}
-		return mfString
 	}
+	a.settings.Known = known
+	a.settings.save()
+	a.rebuildRows()
+}
 
-	devices := a.devices
-	if len(devices) > maxDevices {
-		devices = devices[:maxDevices]
-	}
-	if len(devices) == 0 {
-		text := "No AirPlay receiver found"
-		if a.searching {
-			text = "Searching for AirPlay receivers..."
+func (a *app) forgetDevice(d airplay.AirPlayDevice) {
+	known := a.settings.Known[:0]
+	for _, k := range a.settings.Known {
+		if !mirror.SameDevice(k.device(), d) {
+			known = append(known, k)
 		}
-		appendMenu(menu, mfString|mfGrayed, 0, text)
 	}
-	for i, d := range devices {
-		flags := uint32(mfString)
-		if a.session != nil && mirror.SameDevice(a.session.device, d) {
-			flags |= mfChecked
-		}
-		appendMenu(menu, flags, uintptr(idDevice+i), "Mirror to "+deviceLabel(d))
-	}
-	appendMenu(menu, mfString, idManualIP, "Mirror to an IP address...")
-	appendMenu(menu, mfString, idRefresh, "Search again")
-	appendMenu(menu, mfSeparator, 0, "")
+	a.settings.Known = known
+	a.settings.save()
+	a.rebuildRows()
+}
 
-	stopFlags := uint32(mfString)
-	if a.session == nil {
-		stopFlags |= mfGrayed
+// sessionState is the short state text of the active device.
+func (a *app) sessionState() string {
+	switch {
+	case a.session == nil:
+		return ""
+	case a.streaming:
+		return "connected"
 	}
-	appendMenu(menu, stopFlags, idStop, "Stop mirroring")
-	appendMenu(menu, mfSeparator, 0, "")
+	return "connecting"
+}
 
+// ---- menus ----
+
+func checked(on bool) uint32 {
+	if on {
+		return mfString | mfChecked
+	}
+	return mfString
+}
+
+// appendSettingsMenu adds the settings to a menu. The tray menu and the
+// Settings button of the window use it.
+func (a *app) appendSettingsMenu(menu uintptr) {
 	displays := int(systemMetric(smCMonitors))
-	if displays < 1 {
-		displays = 1
-	}
 	if displays > maxDisplays {
 		displays = maxDisplays
 	}
 	if displays > 1 {
 		sub := createPopupMenu()
 		for i := 0; i < displays; i++ {
-			flags := uint32(mfString)
-			if a.settings.Display == i {
-				flags |= mfChecked
-			}
-			appendMenu(sub, flags, uintptr(idDisplay+i), "Display "+strconv.Itoa(i+1))
+			appendMenu(sub, checked(a.settings.Display == i), uintptr(idDisplay+i), "Display "+strconv.Itoa(i+1))
 		}
 		appendMenu(menu, mfPopup, sub, "Display")
 	}
@@ -434,52 +595,80 @@ func (a *app) showMenu() {
 
 	encoderMenu := createPopupMenu()
 	for i, choice := range encoderChoices {
-		flags := uint32(mfString)
-		if a.settings.Encoder == choice.value {
-			flags |= mfChecked
-		}
-		appendMenu(encoderMenu, flags, uintptr(idEncoder+i), choice.label)
+		appendMenu(encoderMenu, checked(a.settings.Encoder == choice.value), uintptr(idEncoder+i), choice.label)
 	}
 	appendMenu(menu, mfPopup, encoderMenu, "Video encoder")
 
 	fpsMenu := createPopupMenu()
 	for i, fps := range fpsChoices {
-		flags := uint32(mfString)
-		if a.settings.FPS == fps {
-			flags |= mfChecked
-		}
-		appendMenu(fpsMenu, flags, uintptr(idFPS+i), strconv.Itoa(fps)+" frames per second")
+		appendMenu(fpsMenu, checked(a.settings.FPS == fps), uintptr(idFPS+i), strconv.Itoa(fps)+" frames per second")
 	}
 	appendMenu(menu, mfPopup, fpsMenu, "Frame rate")
 
-	cursorFlags := uint32(mfString)
-	if !a.settings.HideCursor {
-		cursorFlags |= mfChecked
-	}
-	appendMenu(menu, cursorFlags, idCursor, "Show the mouse pointer")
 	soundMenu := createPopupMenu()
 	for mode, label := range soundLabels {
 		appendMenu(soundMenu, checked(a.settings.SoundMode == mode), uintptr(idSound+mode), label)
 	}
 	appendMenu(menu, mfPopup, soundMenu, "Sound")
+
+	appendMenu(menu, checked(!a.settings.HideCursor), idCursor, "Show the mouse pointer")
 	appendMenu(menu, mfSeparator, 0, "")
 	appendMenu(menu, checked(a.settings.DebugLog), idDebugLog, "Write a detailed log")
 	appendMenu(menu, mfString, idOpenLog, "Open the log file")
+}
+
+// trackMenu shows a popup menu at a screen position and runs the command.
+func (a *app) trackMenu(menu uintptr, x, y int32) {
+	// The window must be in the foreground, or the menu does not close when
+	// the user clicks outside it.
+	procSetForegroundWindow.Call(a.hwnd)
+	cmd, _, _ := procTrackPopupMenu.Call(menu, tpmRightButton|tpmNoNotify|tpmReturnCmd,
+		uintptr(x), uintptr(y), 0, a.hwnd, 0)
+	postMessage(a.hwnd, 0, 0, 0)
+	a.onCommand(int(cmd))
+}
+
+func (a *app) showTrayMenu() {
+	menu := createPopupMenu()
+	if menu == 0 {
+		return
+	}
+	defer procDestroyMenu.Call(menu)
+
+	appendMenu(menu, mfString, idOpenUI, "Open winairplay")
+	appendMenu(menu, mfString|mfGrayed, 0, a.status)
+	appendMenu(menu, mfSeparator, 0, "")
+	if len(a.rows) == 0 {
+		text := "No AirPlay receiver found"
+		if a.searching {
+			text = "Searching for AirPlay receivers..."
+		}
+		appendMenu(menu, mfString|mfGrayed, 0, text)
+	}
+	for i, row := range a.rows {
+		// "&" marks a keyboard shortcut in a menu. Show it as text.
+		label := strings.ReplaceAll(rowLabel(row, ""), "&", "&&")
+		appendMenu(menu, checked(row.active), uintptr(idDevice+i), "Mirror to "+label)
+	}
+	appendMenu(menu, mfString, idManualIP, "Mirror to an IP address...")
+	appendMenu(menu, mfString, idRefresh, "Search again")
+	appendMenu(menu, mfSeparator, 0, "")
+	stopFlags := uint32(mfString)
+	if a.session == nil {
+		stopFlags |= mfGrayed
+	}
+	appendMenu(menu, stopFlags, idStop, "Stop mirroring")
+	appendMenu(menu, mfSeparator, 0, "")
+	a.appendSettingsMenu(menu)
 	appendMenu(menu, mfString|mfGrayed, 0, appName+" "+version)
 	appendMenu(menu, mfString, idExit, "Exit")
 
 	var pt point
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-	// The window must be in the foreground, or the menu does not close when
-	// the user clicks outside it.
-	procSetForegroundWindow.Call(a.hwnd)
-	cmd, _, _ := procTrackPopupMenu.Call(menu, tpmRightButton|tpmNoNotify|tpmReturnCmd,
-		uintptr(pt.x), uintptr(pt.y), 0, a.hwnd, 0)
-	postMessage(a.hwnd, 0, 0, 0)
-	a.onCommand(int(cmd), devices)
+	a.trackMenu(menu, pt.x, pt.y)
 }
 
-func (a *app) onCommand(cmd int, devices []airplay.AirPlayDevice) {
+func (a *app) onCommand(cmd int) {
 	settingsChanged := func() {
 		a.settings.save()
 		if a.session != nil {
@@ -488,6 +677,8 @@ func (a *app) onCommand(cmd int, devices []airplay.AirPlayDevice) {
 	}
 	switch {
 	case cmd == 0:
+	case cmd == idOpenUI:
+		a.showMainWindow()
 	case cmd == idStop:
 		a.stopSession()
 	case cmd == idRefresh:
@@ -501,21 +692,15 @@ func (a *app) onCommand(cmd int, devices []airplay.AirPlayDevice) {
 	case cmd == idCursor:
 		a.settings.HideCursor = !a.settings.HideCursor
 		settingsChanged()
-	case cmd >= idSound && cmd < idSound+len(soundLabels):
-		// The sound output changes immediately, also during mirroring.
-		a.settings.SoundMode = cmd - idSound
-		airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
-		a.settings.save()
 	case cmd == idPicture4K, cmd == idPictureHD:
 		a.settings.Picture1080p = cmd == idPictureHD
 		settingsChanged()
 	case cmd == idDebugLog:
 		a.settings.DebugLog = !a.settings.DebugLog
 		airplay.SetDebugMode(a.settings.DebugLog)
-		airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
 		a.settings.save()
-	case cmd >= idDevice && cmd < idDevice+len(devices):
-		a.startSession(devices[cmd-idDevice])
+	case cmd >= idDevice && cmd < idDevice+len(a.rows):
+		a.startSession(a.rows[cmd-idDevice].device)
 	case cmd >= idDisplay && cmd < idDisplay+maxDisplays:
 		a.settings.Display = cmd - idDisplay
 		settingsChanged()
@@ -525,6 +710,11 @@ func (a *app) onCommand(cmd int, devices []airplay.AirPlayDevice) {
 	case cmd >= idEncoder && cmd < idEncoder+len(encoderChoices):
 		a.settings.Encoder = encoderChoices[cmd-idEncoder].value
 		settingsChanged()
+	case cmd >= idSound && cmd < idSound+len(soundLabels):
+		// The sound output changes immediately, also during mirroring.
+		a.settings.SoundMode = cmd - idSound
+		airplay.SetAudioOutputMode(airplay.AudioOutputMode(a.settings.SoundMode))
+		a.settings.save()
 	}
 }
 
@@ -540,7 +730,7 @@ func (a *app) openLog() {
 
 func (a *app) mirrorToAddress() {
 	value, ok := a.prompt("Mirror to an IP address",
-		"Enter the IP address of the Apple TV.\nYou can add a port, for example 192.168.1.50:7000.")
+		"Enter the IP address of the Apple TV or the TV.\nYou can add a port, for example 192.168.1.50:7000.")
 	value = strings.TrimSpace(value)
 	if !ok || value == "" {
 		return
@@ -561,9 +751,9 @@ func (a *app) exit() {
 	if s := a.session; s != nil {
 		s.cancel()
 		if a.dialog == nil {
-			// Give the session time to send TEARDOWN to the receiver. With
-			// an open input window the session waits for this thread, so do
-			// not wait for it.
+			// Give the session time to send TEARDOWN to the receiver and to
+			// remove a mute of the PC. With an open input window the session
+			// waits for this thread, so do not wait for it.
 			select {
 			case <-s.done:
 			case <-time.After(3 * time.Second):
@@ -578,6 +768,8 @@ func (a *app) exit() {
 // ---- discovery ----
 
 func (a *app) requestDiscovery() {
+	a.searching = true
+	a.refreshWindow()
 	select {
 	case a.refresh <- struct{}{}:
 	default:
@@ -590,6 +782,7 @@ func (a *app) discoveryLoop() {
 		a.callSync(func() {
 			a.searching = true
 			busy = a.session != nil
+			a.refreshWindow()
 		})
 		var devices []airplay.AirPlayDevice
 		var err error
@@ -622,17 +815,13 @@ func (a *app) discoveryLoop() {
 		select {
 		case <-a.refresh:
 			// Put the request back: the next round reads it.
-			a.requestDiscovery()
+			select {
+			case a.refresh <- struct{}{}:
+			default:
+			}
 		case <-time.After(20 * time.Second):
 		}
 	}
-}
-
-func deviceKey(d airplay.AirPlayDevice) string {
-	if d.DeviceID != "" {
-		return strings.ToLower(d.DeviceID)
-	}
-	return net.JoinHostPort(d.IP, strconv.Itoa(d.Port))
 }
 
 // mergeDevices puts a search result into the list. mDNS answers get lost at
@@ -664,10 +853,8 @@ func (a *app) mergeDevices(found []airplay.AirPlayDevice) {
 			delete(a.missed, key)
 		}
 	}
-	if len(a.devices) == 0 && len(merged) > 0 && a.session == nil {
-		a.setStatus(fmt.Sprintf("Not connected - %d AirPlay receiver(s) found", len(merged)))
-	}
 	a.devices = merged
+	a.rebuildRows()
 }
 
 // ---- sessions ----
@@ -695,14 +882,19 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 	session := &activeSession{device: device, cancel: cancel, done: make(chan struct{})}
 	a.session = session
 	a.streaming = false
-	a.setStatus("Connecting to " + deviceLabel(device))
+	name := device.Name
+	if name == "" {
+		name = device.IP
+	}
+	a.status = "Connecting to " + name
+	a.updateTrayIcon()
+	a.rebuildRows()
 
 	opts := mirror.Options{
-		FPS:        a.settings.FPS,
-		Encoder:    a.settings.Encoder,
-		Display:    a.settings.Display,
-		HideCursor: a.settings.HideCursor,
-
+		FPS:            a.settings.FPS,
+		Encoder:        a.settings.Encoder,
+		Display:        a.settings.Display,
+		HideCursor:     a.settings.HideCursor,
 		HighResolution: !a.settings.Picture1080p,
 	}
 	ui := mirror.UI{
@@ -731,11 +923,21 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 				}
 			})
 		},
+		Identified: func(identified airplay.AirPlayDevice) {
+			a.call(func() {
+				if a.session == session {
+					session.device = identified
+					a.rebuildRows()
+				}
+			})
+		},
 		Streaming: func(receiver, detail string) {
 			a.call(func() {
 				if a.session == session {
 					a.streaming = true
-					a.setStatus("Mirroring to " + receiver + " (" + detail + ")")
+					a.status = "Mirroring to " + receiver + " (" + detail + ")"
+					a.updateTrayIcon()
+					a.rememberDevice(session.device)
 					a.notify(appName, "Mirroring to "+receiver+" started: "+detail+".", false)
 				}
 			})
@@ -766,19 +968,18 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 			}
 			a.session = nil
 			a.streaming = false
-			a.setStatus("Not connected")
+			a.status = "Not connected"
 			if err != nil && !errors.Is(err, mirror.ErrCancelled) {
-				a.notify("Mirroring stopped", shortError(err), true)
+				a.status = "Not connected. Last problem: " + shortText(err.Error())
+				a.notify("Mirroring stopped", shortText(err.Error()), true)
 			}
+			a.updateTrayIcon()
+			a.rebuildRows()
 		})
 	}()
 }
 
-// shortError makes an error text that fits in a notification (255 characters).
-func shortError(err error) string {
-	return shortText(err.Error())
-}
-
+// shortText makes a text that fits in a notification (255 characters).
 func shortText(text string) string {
 	if i := strings.Index(text, "; FFmpeg output:"); i > 0 {
 		text = text[:i] + ". See the log file for the FFmpeg output."
@@ -788,116 +989,4 @@ func shortText(text string) string {
 		text = string(runes[:237]) + "..."
 	}
 	return text
-}
-
-// ---- text input dialog ----
-
-const (
-	promptClassName = "WinAirPlayPrompt"
-	idEdit          = 100
-)
-
-type promptDialog struct {
-	hwnd  uintptr
-	edit  uintptr
-	value string
-	ok    bool
-	done  bool
-}
-
-func (d *promptDialog) cancel() {
-	if d.hwnd != 0 && !d.done {
-		postMessage(d.hwnd, wmClose, 0, 0)
-	}
-}
-
-func (d *promptDialog) finish(ok bool) {
-	if d.done {
-		return
-	}
-	if ok {
-		d.value = windowText(d.edit)
-	}
-	d.ok = ok
-	d.done = true
-	procDestroyWindow.Call(d.hwnd)
-}
-
-func promptWndProc(hwnd, rawMessage, wParam, lParam uintptr) uintptr {
-	a := theApp
-	message := uint32(rawMessage)
-	if a != nil && a.dialog != nil && a.dialog.hwnd == hwnd {
-		switch message {
-		case wmCommand:
-			switch wParam & 0xFFFF {
-			case idOK:
-				a.dialog.finish(true)
-				return 0
-			case idCancel:
-				a.dialog.finish(false)
-				return 0
-			}
-		case wmClose:
-			a.dialog.finish(false)
-			return 0
-		}
-	}
-	return defWindowProc(hwnd, message, wParam, lParam)
-}
-
-// prompt shows a small window with a text field and waits for the user. It
-// runs a message loop of its own, so the tray icon continues to operate.
-// Call it only on the UI thread.
-func (a *app) prompt(title, text string) (string, bool) {
-	if a.dialog != nil {
-		return "", false
-	}
-	const width, height = 380, 190
-	x := (systemMetric(smCxScreen) - width) / 2
-	y := (systemMetric(smCyScreen) - height) / 2
-	d := &promptDialog{}
-	d.hwnd = createWindow(wsExTopmost|wsExDlgFrame, promptClassName, title,
-		wsPopup|wsCaption|wsSysMenu, x, y, width, height, 0, 0)
-	if d.hwnd == 0 {
-		log.Printf("could not create the input window")
-		return "", false
-	}
-	a.dialog = d
-	defer func() { a.dialog = nil }()
-
-	label := createWindow(0, "STATIC", text, wsChild|wsVisible|ssLeft, 16, 14, width-40, 50, d.hwnd, 0)
-	d.edit = createWindow(0, "EDIT", "", wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, 16, 70, width-48, 24, d.hwnd, idEdit)
-	okButton := createWindow(0, "BUTTON", "OK", wsChild|wsVisible|wsTabStop|bsDefPushButton, width-212, 108, 90, 28, d.hwnd, idOK)
-	cancelButton := createWindow(0, "BUTTON", "Cancel", wsChild|wsVisible|wsTabStop, width-116, 108, 90, 28, d.hwnd, idCancel)
-	font, _, _ := procGetStockObject.Call(defaultGUIFont)
-	for _, control := range []uintptr{label, d.edit, okButton, cancelButton} {
-		procSendMessageW.Call(control, wmSetFont, font, 1)
-	}
-
-	procShowWindow.Call(d.hwnd, swShow)
-	procUpdateWindow.Call(d.hwnd)
-	procSetForegroundWindow.Call(d.hwnd)
-	procSetFocus.Call(d.edit)
-
-	var m msg
-	for !d.done {
-		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
-		if int32(r) <= 0 {
-			// WM_QUIT: give it back to the main loop.
-			procPostQuitMessage.Call(m.wParam)
-			if !d.done {
-				d.done = true
-				procDestroyWindow.Call(d.hwnd)
-			}
-			break
-		}
-		// IsDialogMessage gives the Tab, Enter and Escape keys their usual
-		// dialog functions.
-		if handled, _, _ := procIsDialogMessageW.Call(d.hwnd, uintptr(unsafe.Pointer(&m))); handled != 0 {
-			continue
-		}
-		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
-	}
-	return d.value, d.ok
 }

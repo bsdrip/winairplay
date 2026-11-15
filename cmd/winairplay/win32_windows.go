@@ -274,3 +274,107 @@ func stockApplicationIcon() uintptr {
 	h, _, _ := procLoadIconW.Call(0, idiApplication)
 	return h
 }
+
+// ---- additions for the main window ----
+
+var (
+	procFindWindowW              = user32.NewProc("FindWindowW")
+	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
+	procEnableWindow             = user32.NewProc("EnableWindow")
+	procSetWindowTextW           = user32.NewProc("SetWindowTextW")
+	procAdjustWindowRectEx       = user32.NewProc("AdjustWindowRectEx")
+	procSetProcessDPIAware       = user32.NewProc("SetProcessDPIAware")
+	procGetDC                    = user32.NewProc("GetDC")
+	procReleaseDC                = user32.NewProc("ReleaseDC")
+	procSystemParametersInfoW    = user32.NewProc("SystemParametersInfoW")
+	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
+	procIsIconic                 = user32.NewProc("IsIconic")
+	procGetWindowRect            = user32.NewProc("GetWindowRect")
+	procGetDeviceCaps            = gdi32.NewProc("GetDeviceCaps")
+	procCreateFontIndirectW      = gdi32.NewProc("CreateFontIndirectW")
+)
+
+const (
+	wsMinimizeBox = 0x00020000
+	wsVScroll     = 0x00200000
+	wsGroup       = 0x00020000
+
+	lbsNotify           = 0x0001
+	lbsNoIntegralHeight = 0x0100
+	lbAddString         = 0x0180
+	lbResetContent      = 0x0184
+	lbSetCurSel         = 0x0186
+	lbGetCurSel         = 0x0188
+	lbnSelChange        = 1
+	lbnDblClk           = 2
+
+	ssRight    = 0x0002
+	ssNoPrefix = 0x0080
+
+	swHide    = 0
+	swRestore = 9
+
+	logPixelsX              = 88
+	spiGetNonClientMetrics  = 0x0029
+	nonClientMetricsSize    = 504
+	nonClientMessageFontPos = 408
+)
+
+type rect struct{ left, top, right, bottom int32 }
+
+func sendMessage(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
+	r, _, _ := procSendMessageW.Call(hwnd, uintptr(message), wParam, lParam)
+	return r
+}
+
+func setWindowText(hwnd uintptr, text string) {
+	procSetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(u16(text))))
+}
+
+func enableWindow(hwnd uintptr, enabled bool) {
+	var flag uintptr
+	if enabled {
+		flag = 1
+	}
+	procEnableWindow.Call(hwnd, flag)
+}
+
+func showWindow(hwnd uintptr, command int) {
+	procShowWindow.Call(hwnd, uintptr(command))
+}
+
+// systemDPI returns the dots per inch of the primary display (96 = 100 %).
+func systemDPI() int32 {
+	dc, _, _ := procGetDC.Call(0)
+	if dc == 0 {
+		return 96
+	}
+	defer procReleaseDC.Call(0, dc)
+	dpi, _, _ := procGetDeviceCaps.Call(dc, logPixelsX)
+	if dpi < 96 || dpi > 960 {
+		return 96
+	}
+	return int32(dpi)
+}
+
+// messageFont returns the font that Windows uses for dialog text.
+func messageFont() uintptr {
+	var metrics [nonClientMetricsSize]byte
+	*(*uint32)(unsafe.Pointer(&metrics[0])) = nonClientMetricsSize
+	ok, _, _ := procSystemParametersInfoW.Call(spiGetNonClientMetrics, nonClientMetricsSize, uintptr(unsafe.Pointer(&metrics[0])), 0)
+	if ok != 0 {
+		if font, _, _ := procCreateFontIndirectW.Call(uintptr(unsafe.Pointer(&metrics[nonClientMessageFontPos]))); font != 0 {
+			return font
+		}
+	}
+	font, _, _ := procGetStockObject.Call(defaultGUIFont)
+	return font
+}
+
+// windowSizeForClient returns the outer window size for a client area size.
+func windowSizeForClient(width, height int32, style, exStyle uint32) (int32, int32) {
+	r := rect{0, 0, width, height}
+	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&r)), uintptr(style), 0, uintptr(exStyle))
+	return r.right - r.left, r.bottom - r.top
+}

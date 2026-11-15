@@ -105,15 +105,50 @@ jobs:
           go build -trimpath -ldflags "-H windowsgui -s -w -X main.version=$env:VERSION" -o dist\app\winairplay.exe .\cmd\winairplay
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Start test of the tray application
+      - name: Start test of the application
         run: |
           $log = "$env:LOCALAPPDATA\winairplay\winairplay.log"
-          $p = Start-Process dist\app\winairplay.exe -PassThru
-          Start-Sleep -Seconds 8
+          # Two saved devices, so that the device list has contents.
+          New-Item -ItemType Directory -Force "$env:APPDATA\winairplay" | Out-Null
+          '{"encoder":"auto","fps":30,"knownDevices":[{"name":"Living Room","model":"AppleTV14,1","ip":"192.168.0.15","port":7000,"deviceID":"AA:BB:CC:DD:EE:01"},{"name":"Bedroom TV","model":"QN65","ip":"192.168.0.30","port":7000}]}' | Set-Content "$env:APPDATA\winairplay\settings.json" -Encoding utf8
+          # Start in the background (no window), then start again: the second
+          # start must make the first instance show its window.
+          $p = Start-Process dist\app\winairplay.exe -ArgumentList "--background" -PassThru
+          Start-Sleep -Seconds 4
           if ($p.HasExited) { Write-Host "winairplay stopped with exit code $($p.ExitCode)"; if (Test-Path $log) { Get-Content $log }; exit 1 }
+          $second = Start-Process dist\app\winairplay.exe -PassThru
+          Start-Sleep -Seconds 14
+          if (-not $second.HasExited) { Write-Host "the second instance did not exit"; exit 1 }
+          if ($p.HasExited) { Write-Host "winairplay stopped after the second start"; exit 1 }
+          Add-Type @"
+          using System; using System.Runtime.InteropServices;
+          public class W { [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+            [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
+            public struct RECT { public int L, T, R, B; } }
+          "@
+          $h = [W]::FindWindow("WinAirPlayMain", $null)
+          $visible = [W]::IsWindowVisible($h)
+          Write-Host "main window handle $h, visible $visible"
+          try {
+            Add-Type -AssemblyName System.Drawing
+            $r = New-Object W+RECT
+            [W]::GetWindowRect($h, [ref]$r) | Out-Null
+            $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $dc = $g.GetHdc(); [W]::PrintWindow($h, $dc, 2) | Out-Null; $g.ReleaseHdc($dc); $g.Dispose()
+            $bmp.Save("$PWD\dist\window.png")
+            $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\dist\window.png"))
+            Write-Host "SHOT-BEGIN"
+            for ($i = 0; $i -lt $b64.Length; $i += 4000) { Write-Host ("SHOT:" + $b64.Substring($i, [Math]::Min(4000, $b64.Length - $i))) }
+            Write-Host "SHOT-END"
+          } catch { Write-Host "screenshot failed: $_" }
           Stop-Process -Id $p.Id -Force
           Get-Content $log
+          Remove-Item "$env:APPDATA\winairplay\settings.json"
           if (-not (Select-String -Path $log -Pattern "started" -Quiet)) { exit 1 }
+          if (-not $visible) { Write-Host "the second start did not show the window"; exit 1 }
 
       - name: Build the installer
         run: |

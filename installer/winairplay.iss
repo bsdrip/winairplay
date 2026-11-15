@@ -48,7 +48,7 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{autoprograms}\winairplay"; Filename: "{app}\winairplay.exe"; IconFilename: "{app}\winairplay.ico"
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "winairplay"; ValueData: """{app}\winairplay.exe"""; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "winairplay"; ValueData: """{app}\winairplay.exe"" --background"; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\winairplay.exe"; Description: "Start winairplay now"; Flags: nowait postinstall skipifsilent
