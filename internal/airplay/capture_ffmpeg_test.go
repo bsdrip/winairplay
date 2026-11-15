@@ -1,8 +1,11 @@
 package airplay
 
 import (
+	"bytes"
+	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 const sampleEncoderList = `Encoders:
@@ -43,7 +46,7 @@ func TestSelectFFmpegEncoder(t *testing.T) {
 		{"vaapi", "", true}, // GStreamer only
 	}
 	for _, tt := range tests {
-		got, err := selectFFmpegEncoder(caps, tt.hwaccel)
+		got, err := selectFFmpegEncoder(caps, tt.hwaccel, VideoCodecH264, nil)
 		if (err != nil) != tt.wantErr || got.name != tt.want {
 			t.Errorf("selectFFmpegEncoder(%q) = %q, %v; want %q, error %t", tt.hwaccel, got.name, err, tt.want, tt.wantErr)
 		}
@@ -51,10 +54,10 @@ func TestSelectFFmpegEncoder(t *testing.T) {
 
 	// Without x264, automatic selection uses the next software encoder.
 	caps = &ffmpegCapabilities{encoders: map[string]bool{"h264_nvenc": true, "h264_mf": true}}
-	if got, err := selectFFmpegEncoder(caps, "auto"); err != nil || got.name != "h264_mf" {
+	if got, err := selectFFmpegEncoder(caps, "auto", VideoCodecH264, nil); err != nil || got.name != "h264_mf" {
 		t.Errorf("automatic selection without x264 = %q, %v; want h264_mf", got.name, err)
 	}
-	if _, err := selectFFmpegEncoder(&ffmpegCapabilities{encoders: map[string]bool{}}, "auto"); err == nil {
+	if _, err := selectFFmpegEncoder(&ffmpegCapabilities{encoders: map[string]bool{}}, "auto", VideoCodecH264, nil); err == nil {
 		t.Error("automatic selection with no encoder must fail")
 	}
 }
@@ -74,7 +77,7 @@ func TestFFmpegScaleFilter(t *testing.T) {
 
 func TestFFmpegCaptureArgs(t *testing.T) {
 	cfg := CaptureConfig{FPS: 60, Bitrate: 6000, MaxWidth: 1920, MaxHeight: 1080, ShowCursor: true, Display: 1}
-	x264 := ffmpegEncoder{name: "libx264", pixFmt: "yuv420p"}
+	x264 := ffmpegEncoder{name: "libx264", pixFmt: "yuv420p", codec: VideoCodecH264}
 
 	args := strings.Join(ffmpegCaptureArgs(cfg, x264, "ddagrab"), " ")
 	for _, want := range []string{
@@ -91,7 +94,7 @@ func TestFFmpegCaptureArgs(t *testing.T) {
 	}
 
 	cfg.ShowCursor = false
-	args = strings.Join(ffmpegCaptureArgs(cfg, ffmpegEncoder{name: "h264_nvenc", pixFmt: "nv12"}, "gdigrab"), " ")
+	args = strings.Join(ffmpegCaptureArgs(cfg, ffmpegEncoder{name: "h264_nvenc", pixFmt: "nv12", codec: VideoCodecH264}, "gdigrab"), " ")
 	for _, want := range []string{"-f gdigrab -framerate 60 -draw_mouse 0 -i desktop", "-c:v h264_nvenc", "format=nv12", "dump_extra=freq=keyframe"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("gdigrab arguments do not contain %q:\n%s", want, args)
@@ -102,4 +105,115 @@ func TestFFmpegCaptureArgs(t *testing.T) {
 	if !strings.Contains(args, "testsrc2=size=1920x1080:rate=30") {
 		t.Errorf("test arguments must use the test source at 30 fps:\n%s", args)
 	}
+}
+
+func TestSelectFFmpegHEVCEncoder(t *testing.T) {
+	caps := &ffmpegCapabilities{encoders: map[string]bool{"hevc_nvenc": true, "hevc_qsv": true, "hevc_amf": true, "libx265": true}}
+	onlyQSV := func(name string) bool { return name == "hevc_qsv" }
+	if got, err := selectFFmpegEncoder(caps, "auto", VideoCodecHEVC, onlyQSV); err != nil || got.name != "hevc_qsv" {
+		t.Errorf("automatic HEVC selection = %q, %v; want the encoder that operates (hevc_qsv)", got.name, err)
+	}
+	none := func(string) bool { return false }
+	if got, err := selectFFmpegEncoder(caps, "auto", VideoCodecHEVC, none); err != nil || got.name != "libx265" {
+		t.Errorf("automatic HEVC selection without hardware = %q, %v; want libx265", got.name, err)
+	}
+	if got, err := selectFFmpegEncoder(caps, "amf", VideoCodecHEVC, none); err != nil || got.name != "hevc_amf" {
+		t.Errorf("explicit selection = %q, %v; want hevc_amf without a test encode", got.name, err)
+	}
+	if _, err := selectFFmpegEncoder(caps, "openh264", VideoCodecHEVC, none); err == nil {
+		t.Error("openh264 has no HEVC encoder and must fail")
+	}
+	if _, err := selectFFmpegEncoder(&ffmpegCapabilities{encoders: map[string]bool{}}, "auto", VideoCodecHEVC, none); err == nil {
+		t.Error("automatic HEVC selection with no encoder must fail")
+	}
+}
+
+func TestFFmpegBitrate(t *testing.T) {
+	tests := []struct {
+		cfg   CaptureConfig
+		codec VideoCodec
+		want  int
+	}{
+		{CaptureConfig{Bitrate: 7000, MaxWidth: 3840, MaxHeight: 2160}, VideoCodecHEVC, 7000},
+		{CaptureConfig{MaxWidth: 1920, MaxHeight: 1080, FPS: 30}, VideoCodecH264, 11963},
+		{CaptureConfig{}, VideoCodecH264, 11963},
+		{CaptureConfig{MaxWidth: 3840, MaxHeight: 2160, FPS: 30}, VideoCodecHEVC, 24883},
+		{CaptureConfig{MaxWidth: 3840, MaxHeight: 2160, FPS: 60}, VideoCodecHEVC, 40000},
+		{CaptureConfig{MaxWidth: 1280, MaxHeight: 720, FPS: 15}, VideoCodecH264, 4000},
+	}
+	for _, tt := range tests {
+		if got := ffmpegBitrateKbps(tt.cfg, tt.codec); got != tt.want {
+			t.Errorf("ffmpegBitrateKbps(%+v, %s) = %d, want %d", tt.cfg, tt.codec, got, tt.want)
+		}
+	}
+}
+
+func TestFFmpegHEVCArgs(t *testing.T) {
+	cfg := CaptureConfig{FPS: 30, MaxWidth: 3840, MaxHeight: 2160}
+	args := strings.Join(ffmpegCaptureArgs(cfg, ffmpegHEVCEncoders["nvenc"], "ddagrab"), " ")
+	for _, want := range []string{"-c:v hevc_nvenc", "scale=3840:2160:", "-b:v 24883k", "hevc_metadata=aud=insert,dump_extra=freq=keyframe", "-f hevc pipe:1"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("HEVC arguments do not contain %q:\n%s", want, args)
+		}
+	}
+	args = strings.Join(ffmpegCaptureArgs(cfg, ffmpegHEVCEncoders["none"], "test"), " ")
+	if !strings.Contains(args, "aud=1") || strings.Contains(args, "-bsf:v") {
+		t.Errorf("x265 writes its delimiters itself:\n%s", args)
+	}
+}
+
+// hevcNAL builds a NAL unit with a two-byte HEVC header and one payload byte.
+func hevcNAL(typ byte, payload byte) []byte {
+	return []byte{0, 0, 0, 1, typ << 1, 1, payload}
+}
+
+func TestAnnexBAccessUnitReader(t *testing.T) {
+	const firstSlice, nextSlice = 0x80, 0x00
+	var stream []byte
+	// Frame 1: AUD, VPS, SPS, PPS, IDR in two slices.
+	for _, nal := range [][]byte{hevcNAL(35, 0), hevcNAL(32, 0), hevcNAL(33, 0), hevcNAL(34, 0), hevcNAL(19, firstSlice), hevcNAL(19, nextSlice)} {
+		stream = append(stream, nal...)
+	}
+	// Frame 2: AUD and one slice. Frame 3: no AUD, found by the slice flag.
+	stream = append(stream, hevcNAL(35, 0)...)
+	stream = append(stream, hevcNAL(1, firstSlice)...)
+	stream = append(stream, hevcNAL(1, firstSlice)...)
+	// Frame 4 starts and closes frame 3.
+	stream = append(stream, hevcNAL(35, 0)...)
+	stream = append(stream, hevcNAL(1, firstSlice)...)
+
+	clock := time.Unix(1000, 0)
+	reader := newAnnexBAccessUnitReader(iotest1ByteReader{bytes.NewReader(stream)})
+	reader.now = func() time.Time { clock = clock.Add(time.Millisecond); return clock }
+
+	wantNALs := []int{6, 2, 1}
+	var last time.Time
+	for i, want := range wantNALs {
+		unit, err := reader.ReadVideoAccessUnit()
+		if err != nil {
+			t.Fatalf("access unit %d: %v", i+1, err)
+		}
+		if got := len(splitAnnexBAccessUnit(unit.AnnexB)); got != want {
+			t.Errorf("access unit %d has %d NAL units, want %d", i+1, got, want)
+		}
+		if !unit.PTS.After(last) {
+			t.Errorf("access unit %d has time stamp %v, not after %v", i+1, unit.PTS, last)
+		}
+		last = unit.PTS
+	}
+	// The last frame has no following unit, so the stream end is reported.
+	if _, err := reader.ReadVideoAccessUnit(); err != io.EOF {
+		t.Errorf("read after the last complete unit = %v, want io.EOF", err)
+	}
+}
+
+// iotest1ByteReader returns one byte for each Read call. It proves that the
+// reader does not depend on how the pipe splits the stream.
+type iotest1ByteReader struct{ r io.Reader }
+
+func (o iotest1ByteReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return o.r.Read(p[:1])
 }

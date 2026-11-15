@@ -37,10 +37,23 @@ Changes made for winairplay (2026-11-15):
 
 New files in winairplay (not from doubletake):
 
-  - internal/airplay/capture_ffmpeg.go, capture_ffmpeg_test.go,
-    childproc_linux.go, childproc_windows.go, childproc_other.go
+  - internal/airplay/capture_ffmpeg.go (FFmpeg capture, H.264 and HEVC),
+    audio_pcm.go, audio_platform.go, audio_loopback_windows.go,
+    audio_loopback_other.go (sound capture), childproc_*.go, and their tests
   - internal/mirror (the session flow follows cmd/doubletake/main.go)
-  - cmd/winairplay, cmd/winairplay-cli
+  - cmd/winairplay (tray application), installer, .github
+
+internal/airplay/audio.go was changed to start the sound capture of
+winairplay when FFmpeg capture is in use.
+
+FFmpeg
+------
+
+The installer includes ffmpeg.exe, an unchanged build of FFmpeg from
+https://www.gyan.dev/ffmpeg/builds/ (https://github.com/GyanD/codexffmpeg).
+That build is licensed under the GNU General Public License, version 3. Its
+license text is installed as FFMPEG-LICENSE.txt. The FFmpeg source code is
+at https://ffmpeg.org. winairplay starts FFmpeg as a separate program.
 
 Trademarks
 ----------

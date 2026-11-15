@@ -1,135 +1,135 @@
 # winairplay
 
-winairplay mirrors the screen of a Windows PC to an Apple TV with the AirPlay
-protocol. It runs as an icon in the notification area of the taskbar.
+winairplay mirrors the screen and the sound of a Windows PC to an Apple TV
+with the AirPlay protocol. It runs as an icon in the notification area of the
+taskbar.
 
-**Status: first version. Video only, no sound.** The automated tests pass
-against a software test receiver. The program is not yet tested with a real
-Apple TV. See [Test status](#test-status).
+## Install
 
-## What it does
+1. Open the [Releases](../../releases) page and download
+   `winairplay-setup-<version>.exe`.
+2. Run it. Windows SmartScreen shows a warning, because the installer has no
+   code signature. Select **More info**, then **Run anyway**.
+3. Start **winairplay** from the Start menu.
 
-- Finds the AirPlay receivers on the local network (mDNS).
-- Pairs with the Apple TV. The Apple TV shows a PIN one time; winairplay saves
-  the pairing keys in the Windows Credential Manager.
-- Does the FairPlay handshake that an Apple TV requires for screen mirroring.
-- Captures the screen with FFmpeg (Desktop Duplication API), encodes H.264 and
-  sends the encrypted video stream.
+The installer needs no administrator rights. It includes FFmpeg, which
+winairplay uses to capture and encode the screen.
 
-## Requirements
+## Use
 
-- Windows 10 or Windows 11, 64-bit.
-- FFmpeg 6.0 or later with the `ddagrab` filter and an H.264 encoder. The
-  builds from gyan.dev and BtbN include them.
-  - Install it with `winget install Gyan.FFmpeg`, or
-  - put `ffmpeg.exe` in the same directory as `winairplay.exe`.
-- The PC and the Apple TV must be on the same network.
-- To build: Go 1.24 or later.
-
-## Build
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1
-```
-
-The script writes three programs into `bin`:
-
-| Program | Function |
-| --- | --- |
-| `winairplay.exe` | The tray application. |
-| `winairplay-cli.exe` | The same function on the command line, with a full log. |
-| `winairplay-test-receiver.exe` | A software AirPlay receiver for tests. It shows no picture. |
-
-On Linux or macOS, `make windows` cross-compiles the same programs.
-
-## Use the tray application
-
-1. Start `winairplay.exe`. An icon of a screen appears in the notification
-   area. If you do not see it, click the arrow (`^`) next to the clock.
-2. When Windows Firewall asks, allow access on private networks. The Apple TV
-   must be able to send timing packets to the PC.
-3. Click the icon. Click **Mirror to _name of your Apple TV_**.
+1. Click the screen icon in the notification area. If you do not see it,
+   click the arrow (`^`) next to the clock.
+2. When Windows Firewall asks, allow access on private networks.
+3. Click **Mirror to _name of your Apple TV_**.
 4. The first time, the Apple TV shows a PIN. Type it into the window that
    winairplay opens.
-5. The icon becomes blue when mirroring is active.
+5. The icon becomes blue when mirroring is active. The first line of the menu
+   shows the picture size, for example `3840 x 2160 HEVC`.
 6. To stop, click the icon and click **Stop mirroring**.
 
-The menu also has these settings. A changed setting applies to the next
-session.
+winairplay searches the network for receivers continuously (mDNS). If that
+finds nothing, it also tries each address of the local network on the AirPlay
+port.
+
+### Menu
+
+A changed setting applies to the next session.
 
 | Menu item | Function |
 | --- | --- |
-| Mirror to an IP address... | Connects without discovery. Use it if the list stays empty. |
+| Mirror to an IP address... | Connects to an address that you type. |
+| Search again | Searches for receivers immediately. |
 | Display | Selects the monitor (only with more than one monitor). |
-| Video encoder | Automatic uses the x264 software encoder. Select NVIDIA, Intel or AMD to use the graphics hardware. |
+| Picture | **4K**: HEVC video at up to 3840 x 2160. **1080p**: H.264 video. |
+| Video encoder | **Automatic** is correct for most computers. Select NVIDIA, Intel or AMD to force one graphics card encoder. |
 | Frame rate | 15, 30 or 60 frames per second. |
 | Show the mouse pointer | Includes the pointer in the picture. |
+| Send the sound of the PC | Sends what the PC plays to the TV. |
+| Write a detailed log | Adds the protocol messages to the log file. |
 | Open the log file | Opens `%LocalAppData%\winairplay\winairplay.log`. |
 
-## Use the command line program
+### 4K
 
-```powershell
-bin\winairplay-cli.exe -list                      # show the receivers
-bin\winairplay-cli.exe -name "Living Room"        # mirror to a receiver
-bin\winairplay-cli.exe -target 192.168.1.50       # mirror to an address
-bin\winairplay-cli.exe -name "Living Room" -test  # send a test pattern
-bin\winairplay-cli.exe -name "Living Room" -debug # full protocol log
-```
+4K needs these three things:
 
-Press Ctrl+C to stop. `winairplay-cli.exe -help` shows all options.
+- An Apple TV 4K that is set to a 4K output format.
+- A graphics card with an HEVC encoder (NVIDIA, Intel or AMD from
+  approximately 2016 or later). **Automatic** tests the encoders and uses the
+  first one that operates.
+- A good network connection: winairplay sends approximately 25 Mbit/s at 30
+  frames per second. A network cable to the Apple TV is best.
+
+If 4K cannot start, winairplay shows a notice and uses 1080p.
+
+### Sound
+
+winairplay sends the sound that the PC plays on its default output device.
+The PC speakers continue to play. Mute them if you want sound only from the
+TV: use the mute key of the speakers or monitor, because the Windows volume
+control can also change the sound that goes to the TV.
 
 ## Troubleshooting
 
 | Symptom | Possible cause and remedy |
 | --- | --- |
-| "FFmpeg not found" | Install FFmpeg or put `ffmpeg.exe` next to `winairplay.exe`. |
-| The receiver list is empty | The firewall or the network blocks mDNS (UDP port 5353). Use **Mirror to an IP address...**. Some guest and corporate networks isolate the devices from each other. |
+| The receiver list is empty | Click **Search again**. If the list stays empty, use **Mirror to an IP address...**. Some guest and corporate networks isolate the devices from each other. |
 | Pairing fails | On the Apple TV, open Settings > AirPlay and HomeKit. Set **Allow Access** to "Anyone on the Same Network". Then try again. |
 | The session stops after some seconds | Allow `winairplay.exe` in Windows Firewall for private networks. |
+| Notice "4K is not available" | Read the reason in the notice. See [4K](#4k). |
+| The 4K picture stutters | Select 30 frames per second, use a network cable, or select **1080p**. |
+| No sound | Make sure that **Send the sound of the PC** has a check mark and that the sound plays on the default output device of Windows. |
 | The picture is black for protected video | Windows does not let programs capture DRM-protected video. This is normal. |
-| A hardware encoder fails | Select **Automatic (software)**. Then read the FFmpeg messages in the log file. |
 
-If a problem continues, run `winairplay-cli.exe` with `-debug` and read the
-output.
+For other problems, select **Write a detailed log**, repeat the steps, and
+read the log file.
+
+## Build from source
+
+Requirements: Go 1.24 or later. To run the program, FFmpeg 6.0 or later must
+be on `PATH` or next to `winairplay.exe`.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+GitHub Actions builds the installer (`.github/workflows/build.yml`). To make
+a release, push a tag: `git tag v1.2.3` and `git push origin v1.2.3`.
 
 ## Test status
 
 | Item | Status |
 | --- | --- |
-| Protocol code from doubletake | Upstream reports operation with Apple TV 4K (AppleTV11,1 and AppleTV14,1) from Linux. |
-| Full session on loopback (pairing, FairPlay, encrypted video from FFmpeg) | Automated test, passes on Linux. |
-| Windows build | Compiles. `go vet` reports no problems. |
-| Tray application on Windows | Not tested. |
-| Screen capture with `ddagrab` on Windows | Not tested. |
-| Mirroring to a real Apple TV from Windows | Not tested. |
+| Mirroring from Windows to a real Apple TV, 1080p H.264 | Confirmed by a user with version 0.1. |
+| 4K HEVC, sound, network scan | Automated tests pass against a software test receiver. Not yet confirmed with a real Apple TV. |
+| Hardware HEVC encoders (NVIDIA, Intel, AMD) | Not tested: the build servers have no graphics card. |
+| Installer | Each build installs, starts and uninstalls the program on Windows. |
 
 Run the tests with `go test ./...` on Linux. The session tests need FFmpeg
-with libx264 and are skipped without it. The tests of `internal/airplay` come
-from doubletake and many of them need Linux; they were not run on Windows.
+and are skipped without it. Many tests of `internal/airplay` come from
+doubletake and need Linux.
 
 ## Limits
 
-- No sound. Audio capture (WASAPI loopback) is not implemented.
-- H.264 only. The receiver scales the picture to its screen; winairplay sends
-  at most the canvas size that the receiver gives (usually 1920 x 1080).
 - One receiver at a time.
+- No HDR.
+- The sound comes from the default output device only.
 
 ## Structure
 
 | Path | Contents |
 | --- | --- |
-| `internal/airplay` | AirPlay protocol (from doubletake) and the FFmpeg capture backend. |
-| `internal/mirror` | One mirroring session: connect, pair, FairPlay, capture, stream. |
+| `internal/airplay` | AirPlay protocol (from doubletake), FFmpeg capture and sound capture. |
+| `internal/mirror` | One mirroring session, and the search for receivers. |
 | `cmd/winairplay` | Tray application (Win32 API, no GUI library). |
-| `cmd/winairplay-cli` | Command line program. |
-| `cmd/winairplay-test-receiver` | Software receiver for tests (from doubletake). |
+| `cmd/winairplay-test-receiver` | Software receiver for tests (from doubletake). It is not in the installer. |
+| `installer` | Inno Setup script and icon. |
 
 ## License and origin
 
 winairplay is licensed under the LGPL-3.0-or-later. The AirPlay protocol
 code, which includes the FairPlay handshake, comes from
 [doubletake](https://github.com/omarroth/doubletake) by Omar Roth. See
-[NOTICE](NOTICE) for the list of changes.
+[NOTICE](NOTICE) for the list of changes and for the FFmpeg license.
 
 The FairPlay handshake is used here only for interoperability: to show your
 own screen on your own Apple TV. winairplay does not decrypt or copy protected

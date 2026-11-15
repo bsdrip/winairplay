@@ -27,6 +27,9 @@ import (
 	"github.com/bsdrip/winairplay/internal/mirror"
 )
 
+// version is set by the build (-ldflags "-X main.version=1.2.3").
+var version = "dev"
+
 const (
 	appName = "winairplay"
 
@@ -41,6 +44,10 @@ const (
 	idOpenLog   = 4
 	idExit      = 5
 	idCursor    = 6
+	idSound     = 7
+	idDebugLog  = 8
+	idPicture4K = 9
+	idPictureHD = 10
 	idEncoder   = 100  // + index in encoderChoices
 	idFPS       = 200  // + index in fpsChoices
 	idDisplay   = 300  // + zero-based display index
@@ -50,7 +57,7 @@ const (
 )
 
 var encoderChoices = []struct{ value, label string }{
-	{"auto", "Automatic (software)"},
+	{"auto", "Automatic"},
 	{"nvenc", "NVIDIA (NVENC)"},
 	{"qsv", "Intel (Quick Sync)"},
 	{"amf", "AMD (AMF)"},
@@ -65,6 +72,10 @@ type settings struct {
 	FPS        int    `json:"fps"`
 	Display    int    `json:"display"`
 	HideCursor bool   `json:"hideCursor"`
+	// Picture1080p selects H.264 at 1080p. The default is 4K (HEVC).
+	Picture1080p bool `json:"picture1080p"`
+	NoSound      bool `json:"noSound"`
+	DebugLog     bool `json:"debugLog"`
 }
 
 func settingsPath() string {
@@ -121,6 +132,7 @@ type app struct {
 	// The fields below are used only on the UI thread.
 	settings  settings
 	devices   []airplay.AirPlayDevice
+	missed    map[string]int // scans in a row that did not find a device
 	searching bool
 	session   *activeSession
 	streaming bool
@@ -148,7 +160,8 @@ func main() {
 	a := &app{settings: loadSettings(), status: "Not connected", refresh: make(chan struct{}, 1)}
 	theApp = a
 	a.logPath = setupLog()
-	log.Printf("%s started", appName)
+	airplay.SetDebugMode(a.settings.DebugLog)
+	log.Printf("%s %s started", appName, version)
 
 	if err := a.createWindows(); err != nil {
 		log.Printf("startup failed: %v", err)
@@ -332,13 +345,6 @@ func deviceLabel(d airplay.AirPlayDevice) string {
 	return strings.ReplaceAll(name, "&", "&&")
 }
 
-func sameDevice(a, b airplay.AirPlayDevice) bool {
-	if a.DeviceID != "" && b.DeviceID != "" {
-		return strings.EqualFold(a.DeviceID, b.DeviceID)
-	}
-	return a.IP == b.IP && a.Port == b.Port
-}
-
 func (a *app) showMenu() {
 	menu := createPopupMenu()
 	if menu == 0 {
@@ -348,6 +354,12 @@ func (a *app) showMenu() {
 
 	appendMenu(menu, mfString|mfGrayed, 0, a.status)
 	appendMenu(menu, mfSeparator, 0, "")
+	checked := func(on bool) uint32 {
+		if on {
+			return mfString | mfChecked
+		}
+		return mfString
+	}
 
 	devices := a.devices
 	if len(devices) > maxDevices {
@@ -362,7 +374,7 @@ func (a *app) showMenu() {
 	}
 	for i, d := range devices {
 		flags := uint32(mfString)
-		if a.session != nil && sameDevice(a.session.device, d) {
+		if a.session != nil && mirror.SameDevice(a.session.device, d) {
 			flags |= mfChecked
 		}
 		appendMenu(menu, flags, uintptr(idDevice+i), "Mirror to "+deviceLabel(d))
@@ -397,6 +409,11 @@ func (a *app) showMenu() {
 		appendMenu(menu, mfPopup, sub, "Display")
 	}
 
+	pictureMenu := createPopupMenu()
+	appendMenu(pictureMenu, checked(!a.settings.Picture1080p), idPicture4K, "4K, if the TV and the graphics card can do it")
+	appendMenu(pictureMenu, checked(a.settings.Picture1080p), idPictureHD, "1080p")
+	appendMenu(menu, mfPopup, pictureMenu, "Picture")
+
 	encoderMenu := createPopupMenu()
 	for i, choice := range encoderChoices {
 		flags := uint32(mfString)
@@ -422,8 +439,11 @@ func (a *app) showMenu() {
 		cursorFlags |= mfChecked
 	}
 	appendMenu(menu, cursorFlags, idCursor, "Show the mouse pointer")
+	appendMenu(menu, checked(!a.settings.NoSound), idSound, "Send the sound of the PC")
 	appendMenu(menu, mfSeparator, 0, "")
+	appendMenu(menu, checked(a.settings.DebugLog), idDebugLog, "Write a detailed log")
 	appendMenu(menu, mfString, idOpenLog, "Open the log file")
+	appendMenu(menu, mfString|mfGrayed, 0, appName+" "+version)
 	appendMenu(menu, mfString, idExit, "Exit")
 
 	var pt point
@@ -459,6 +479,16 @@ func (a *app) onCommand(cmd int, devices []airplay.AirPlayDevice) {
 	case cmd == idCursor:
 		a.settings.HideCursor = !a.settings.HideCursor
 		settingsChanged()
+	case cmd == idSound:
+		a.settings.NoSound = !a.settings.NoSound
+		settingsChanged()
+	case cmd == idPicture4K, cmd == idPictureHD:
+		a.settings.Picture1080p = cmd == idPictureHD
+		settingsChanged()
+	case cmd == idDebugLog:
+		a.settings.DebugLog = !a.settings.DebugLog
+		airplay.SetDebugMode(a.settings.DebugLog)
+		a.settings.save()
 	case cmd >= idDevice && cmd < idDevice+len(devices):
 		a.startSession(devices[cmd-idDevice])
 	case cmd >= idDisplay && cmd < idDisplay+maxDisplays:
@@ -530,23 +560,89 @@ func (a *app) requestDiscovery() {
 }
 
 func (a *app) discoveryLoop() {
-	for {
-		a.call(func() { a.searching = true })
-		devices, err := mirror.Discover(context.Background(), 4*time.Second)
+	for round := 0; ; round++ {
+		var busy bool
+		a.callSync(func() {
+			a.searching = true
+			busy = a.session != nil
+		})
+		var devices []airplay.AirPlayDevice
+		var err error
+		// mDNS finds the receivers in most networks. If it finds nothing, a
+		// scan of the local network addresses follows: at the start, when the
+		// user selects "Search again", and then one time in each two minutes.
+		// No scan runs during mirroring.
+		forced := false
+		select {
+		case <-a.refresh:
+			forced = true
+		default:
+		}
+		if !busy && (forced || round%6 == 0) {
+			var scanned bool
+			devices, scanned, err = mirror.FindReceivers(context.Background(), 4*time.Second)
+			if scanned {
+				log.Printf("mDNS found no receiver; the network scan found %d", len(devices))
+			}
+		} else {
+			devices, err = mirror.Discover(context.Background(), 4*time.Second)
+		}
 		if err != nil {
 			log.Printf("discovery failed: %v", err)
 		}
 		a.call(func() {
 			a.searching = false
-			if err == nil {
-				a.devices = devices
-			}
+			a.mergeDevices(devices)
 		})
 		select {
 		case <-a.refresh:
+			// Put the request back: the next round reads it.
+			a.requestDiscovery()
 		case <-time.After(20 * time.Second):
 		}
 	}
+}
+
+func deviceKey(d airplay.AirPlayDevice) string {
+	if d.DeviceID != "" {
+		return strings.ToLower(d.DeviceID)
+	}
+	return net.JoinHostPort(d.IP, strconv.Itoa(d.Port))
+}
+
+// mergeDevices puts a search result into the list. mDNS answers get lost at
+// times, so a receiver stays in the list until three searches in a row did
+// not find it.
+func (a *app) mergeDevices(found []airplay.AirPlayDevice) {
+	if a.missed == nil {
+		a.missed = map[string]int{}
+	}
+	seen := map[string]bool{}
+	merged := make([]airplay.AirPlayDevice, 0, len(found)+len(a.devices))
+	for _, d := range found {
+		if key := deviceKey(d); !seen[key] {
+			seen[key] = true
+			a.missed[key] = 0
+			merged = append(merged, d)
+		}
+	}
+	for _, d := range a.devices {
+		key := deviceKey(d)
+		if seen[key] {
+			continue
+		}
+		a.missed[key]++
+		if a.missed[key] < 3 {
+			seen[key] = true
+			merged = append(merged, d)
+		} else {
+			delete(a.missed, key)
+		}
+	}
+	if len(a.devices) == 0 && len(merged) > 0 && a.session == nil {
+		a.setStatus(fmt.Sprintf("Not connected - %d AirPlay receiver(s) found", len(merged)))
+	}
+	a.devices = merged
 }
 
 // ---- sessions ----
@@ -581,6 +677,9 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 		Encoder:    a.settings.Encoder,
 		Display:    a.settings.Display,
 		HideCursor: a.settings.HideCursor,
+
+		HighResolution: !a.settings.Picture1080p,
+		NoSound:        a.settings.NoSound,
 	}
 	ui := mirror.UI{
 		AskCredential: func(prompt mirror.Prompt, receiver string) (string, bool) {
@@ -608,12 +707,19 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 				}
 			})
 		},
-		Streaming: func(receiver string) {
+		Streaming: func(receiver, detail string) {
 			a.call(func() {
 				if a.session == session {
 					a.streaming = true
-					a.setStatus("Mirroring to " + receiver)
-					a.notify(appName, "Mirroring to "+receiver+" started.", false)
+					a.setStatus("Mirroring to " + receiver + " (" + detail + ")")
+					a.notify(appName, "Mirroring to "+receiver+" started: "+detail+".", false)
+				}
+			})
+		},
+		Notice: func(message string) {
+			a.call(func() {
+				if a.session == session {
+					a.notify(appName, shortText(message), false)
 				}
 			})
 		},
@@ -646,7 +752,10 @@ func (a *app) startSession(device airplay.AirPlayDevice) {
 
 // shortError makes an error text that fits in a notification (255 characters).
 func shortError(err error) string {
-	text := err.Error()
+	return shortText(err.Error())
+}
+
+func shortText(text string) string {
 	if i := strings.Index(text, "; FFmpeg output:"); i > 0 {
 		text = text[:i] + ". See the log file for the FFmpeg output."
 	}

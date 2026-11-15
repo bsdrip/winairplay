@@ -249,6 +249,9 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		cancel()
 		return nil, fmt.Errorf("unsupported audio codec %d", codec)
 	}
+	if useFFmpegCapture() {
+		return startPlatformAudioCapture(captureCtx, cancel, testTone, codec)
+	}
 	_, codecSPF, _, _, _, _ := codec.Info()
 
 	// Detect audio source

@@ -1,3 +1,6 @@
 /bin/
 *.exe
 *.log
+/dist/
+/ffdl/
+*.syso
