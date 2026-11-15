@@ -128,7 +128,7 @@ jobs:
             [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
             public struct RECT { public int L, T, R, B; } }
           "@
-          $h = [W]::FindWindow("WinAirPlayMain", $null)
+          $h = [W]::FindWindow("WinAirPlayMain", "winairplay")
           $visible = [W]::IsWindowVisible($h)
           Write-Host "main window handle $h, visible $visible"
           try {
